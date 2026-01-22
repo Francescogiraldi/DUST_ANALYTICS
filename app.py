@@ -506,8 +506,8 @@ def main() -> None:
 
         st.divider()
         colA, colB = st.columns(2)
-        run = colA.button("🚀 Charger", use_container_width=True)
-        if colB.button("🧹 Vider cache", use_container_width=True):
+        run = colA.button("Charger", use_container_width=True)
+        if colB.button("Vider cache", use_container_width=True):
             st.cache_data.clear()
             st.toast("Cache vidé.")
 
