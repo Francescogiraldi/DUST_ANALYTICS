@@ -553,11 +553,11 @@ def main() -> None:
     # Tabs
     # ============================
     t_resume, t_agents, t_llm, t_users, t_data = st.tabs([
-        "📌 Résumé ROI",
-        "🤖 Agents (publiés / non publiés)",
-        "🧠 Modèles (LLM de base vs via agents)",
-        "👤 Utilisateurs (zéro & ciblage)",
-        "🗂 Données & exports",
+        "Résumé ROI",
+        "Agents (publiés / non publiés)",
+        "Modèles (LLM de base vs via agents)",
+        "Utilisateurs (zéro & ciblage)",
+        "Données & exports",
     ])
 
     # ----------------------------
