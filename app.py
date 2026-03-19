@@ -72,7 +72,7 @@ def cout_ttc_periode_par_membres(
 
 
 # ============================
-# Mapping providers / modèles (robuste NaN)
+# Mapping providers / modèles
 # ============================
 def is_na(x: Any) -> bool:
     try:
@@ -362,6 +362,20 @@ def assign_user_segment(message_count: int) -> str:
     return "Fort (>20)"
 
 
+def regularity_bucket_from_pct(pct: float) -> str:
+    if pct <= 0:
+        return "0%"
+    if pct <= 25:
+        return "1–25%"
+    if pct <= 50:
+        return "26–50%"
+    if pct <= 75:
+        return "51–75%"
+    if pct < 100:
+        return "76–99%"
+    return "100%"
+
+
 def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFrame) -> pd.DataFrame:
     users = users_df.copy()
 
@@ -378,7 +392,7 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
         users["semaines_actives"] = 0
         users["semaines_periode"] = 0
         users["taux_couverture_semaines_pct"] = 0.0
-        users["actif_chaque_semaine"] = False
+        users["regularite_periode"] = "0%"
         return users
 
     df = msgs_df.copy().dropna(subset=["created_at"])
@@ -386,7 +400,7 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
         users["semaines_actives"] = 0
         users["semaines_periode"] = 0
         users["taux_couverture_semaines_pct"] = 0.0
-        users["actif_chaque_semaine"] = False
+        users["regularite_periode"] = "0%"
         return users
 
     iso = df["created_at"].dt.isocalendar()
@@ -413,7 +427,7 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
     users["taux_couverture_semaines_pct"] = (
         100.0 * users["semaines_actives"] / max(1, total_weeks)
     ).round(1)
-    users["actif_chaque_semaine"] = users["semaines_actives"] >= max(1, total_weeks)
+    users["regularite_periode"] = users["taux_couverture_semaines_pct"].apply(regularity_bucket_from_pct)
 
     if "lastMessageSent" in users.columns:
         users["dernier_message"] = users["dernier_message_logs"].fillna(users["lastMessageSent"])
@@ -792,20 +806,8 @@ def main() -> None:
                         height=260,
                     )
 
-            if {"distinctUsersReached", "messages"}.issubset(set(as_df.columns)):
-                fig3 = px.scatter(
-                    as_df,
-                    x="distinctUsersReached",
-                    y="messages",
-                    color="settings" if "settings" in as_df.columns else None,
-                    size="distinctConversations" if "distinctConversations" in as_df.columns else None,
-                    hover_name="name" if "name" in as_df.columns else None,
-                    title="Adoption agents : utilisateurs atteints vs volume (messages)",
-                )
-                st.plotly_chart(fig3, use_container_width=True)
-
     # ----------------------------
-    # Modèles (base vs via agents)
+    # Modèles
     # ----------------------------
     with t_llm:
         st.subheader("Comparatif modèles — LLM de base vs via agents")
@@ -869,20 +871,22 @@ def main() -> None:
     # ----------------------------
     with t_users:
         st.subheader("Utilisateurs & segmentation")
-        st.caption("Vue simple pour comprendre l’adoption : inactifs, faibles utilisateurs, moyens et forts.")
+        st.caption(
+            "Vue simple pour comprendre l’adoption : volume d’usage et régularité sur la période."
+        )
 
         nb_inactifs = int((users_seg["segment_usage"] == "Inactifs (0)").sum())
         nb_faible = int((users_seg["segment_usage"] == "Faible (1–3)").sum())
         nb_moyen = int((users_seg["segment_usage"] == "Moyen (4–20)").sum())
         nb_fort = int((users_seg["segment_usage"] == "Fort (>20)").sum())
-        nb_regulars = int(users_seg["actif_chaque_semaine"].sum()) if "actif_chaque_semaine" in users_seg.columns else 0
+        nb_reguliers_max = int((users_seg["regularite_periode"] == "100%").sum()) if "regularite_periode" in users_seg.columns else 0
 
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Inactifs", f"{nb_inactifs:,}")
         k2.metric("Faible (1–3)", f"{nb_faible:,}")
         k3.metric("Moyen (4–20)", f"{nb_moyen:,}")
         k4.metric("Fort (>20)", f"{nb_fort:,}")
-        k5.metric("Actifs chaque semaine", f"{nb_regulars:,}")
+        k5.metric("Réguliers 100%", f"{nb_reguliers_max:,}")
 
         st.divider()
 
@@ -928,22 +932,29 @@ def main() -> None:
             st.plotly_chart(fig_hist, use_container_width=True)
 
         with viz4:
-            weekly_counts = (
-                users_seg["actif_chaque_semaine"]
-                .map({True: "Oui", False: "Non"})
+            regularity_order = ["0%", "1–25%", "26–50%", "51–75%", "76–99%", "100%"]
+            regularity_counts = (
+                users_seg["regularite_periode"]
                 .value_counts()
-                .reindex(["Oui", "Non"], fill_value=0)
+                .reindex(regularity_order, fill_value=0)
                 .reset_index()
             )
-            weekly_counts.columns = ["actif_chaque_semaine", "utilisateurs"]
+            regularity_counts.columns = ["regularite", "utilisateurs"]
 
-            fig_weekly = px.bar(
-                weekly_counts,
-                x="actif_chaque_semaine",
+            fig_regularity = px.bar(
+                regularity_counts,
+                x="regularite",
                 y="utilisateurs",
-                title="Utilisateurs ayant utilisé Dust au moins une fois chaque semaine"
+                title="Régularité sur la période (% de semaines avec au moins 1 usage)"
             )
-            st.plotly_chart(fig_weekly, use_container_width=True)
+            st.plotly_chart(fig_regularity, use_container_width=True)
+
+        st.info(
+            "Lecture du graphique de régularité : "
+            "**100%** = l’utilisateur a utilisé Dust au moins une fois toutes les semaines de la période ; "
+            "**51–75%** = il a été actif sur environ la moitié à trois quarts des semaines ; "
+            "**0%** = aucun usage sur la période."
+        )
 
         st.divider()
         st.subheader("Liste globale des utilisateurs")
@@ -958,7 +969,7 @@ def main() -> None:
                 "semaines_actives",
                 "semaines_periode",
                 "taux_couverture_semaines_pct",
-                "actif_chaque_semaine",
+                "regularite_periode",
                 "dernier_message",
                 "groups",
             ] if c in users_seg.columns
@@ -973,7 +984,7 @@ def main() -> None:
             "semaines_actives": "semaines_actives",
             "semaines_periode": "semaines_période",
             "taux_couverture_semaines_pct": "% couverture semaines",
-            "actif_chaque_semaine": "actif_chaque_semaine",
+            "regularite_periode": "régularité période",
             "dernier_message": "dernier_message",
             "groups": "groupe",
         })
@@ -1001,12 +1012,12 @@ def main() -> None:
                 mime="text/csv",
             )
 
-        if "actif_chaque_semaine" in users_seg_display.columns:
-            weekly_regular = users_seg_display[users_seg_display["actif_chaque_semaine"] == True]
+        if "régularité période" in users_seg_display.columns:
+            weekly_regular = users_seg_display[users_seg_display["régularité période"] == "100%"]
             st.download_button(
-                "Télécharger les utilisateurs actifs chaque semaine (CSV)",
+                "Télécharger les utilisateurs réguliers 100% (CSV)",
                 data=weekly_regular.to_csv(index=False).encode("utf-8"),
-                file_name="utilisateurs_actifs_chaque_semaine.csv",
+                file_name="utilisateurs_reguliers_100pct.csv",
                 mime="text/csv",
             )
 
