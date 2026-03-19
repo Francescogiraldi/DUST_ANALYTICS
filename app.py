@@ -5,20 +5,14 @@ from datetime import date
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
-import plotly.express as px
 
 # ============================
 # Configuration Streamlit
 # ============================
 st.set_page_config(page_title="Dust — ROI & Usage Dashboard", layout="wide")
-
-
-# ============================
-# Références API (documentation)
-# ============================
-# Endpoint: GET https://dust.tt/api/v1/w/{wId}/workspace-usage (CSV ou JSON)
 
 
 # ============================
@@ -60,17 +54,21 @@ def months_inclusive(start_ym: str, end_ym: str) -> int:
     return (ey - sy) * 12 + (em - sm) + 1
 
 
-def cout_ttc(mensuel_ht: float, tva_pct: float) -> float:
-    return float(mensuel_ht) * (1.0 + float(tva_pct) / 100.0)
+def cout_ttc_membre(prix_unitaire_ht: float, tva_pct: float) -> float:
+    return float(prix_unitaire_ht) * (1.0 + float(tva_pct) / 100.0)
 
 
-def cout_ttc_periode(mode: str, start_ym: str, end_ym: Optional[str], mensuel_ht: float, tva_pct: float) -> float:
-    mensuel = cout_ttc(mensuel_ht, tva_pct)
-    if mode == "month":
-        return mensuel
-    if not end_ym:
-        return mensuel
-    return mensuel * months_inclusive(start_ym, end_ym)
+def cout_ttc_periode_par_membres(
+    mode: str,
+    start_ym: str,
+    end_ym: Optional[str],
+    membres_total: int,
+    prix_unitaire_ht: float,
+    tva_pct: float,
+) -> float:
+    nb_mois = 1 if mode == "month" or not end_ym else months_inclusive(start_ym, end_ym)
+    prix_unitaire_ttc = cout_ttc_membre(prix_unitaire_ht, tva_pct)
+    return float(membres_total) * prix_unitaire_ttc * nb_mois
 
 
 # ============================
@@ -256,27 +254,34 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     df = msgs_df.copy()
 
     if "user_id" in df.columns and "user_id" in users_df.columns:
+        available_user_cols = [
+            c for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"]
+            if c in users_df.columns
+        ]
         df = df.merge(
-            users_df[["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"]],
+            users_df[available_user_cols],
             on="user_id",
             how="left",
-            suffixes=("", "_user")
+            suffixes=("", "_user"),
         )
 
-    if "user_name" in df.columns:
+    if "user_name" in df.columns and "user_id" in df.columns:
         df["user_label"] = df["user_name"].fillna(df["user_id"].astype(str))
+    elif "user_id" in df.columns:
+        df["user_label"] = df["user_id"].astype(str)
     else:
-        df["user_label"] = df["user_id"].astype(str) if "user_id" in df.columns else "Inconnu"
+        df["user_label"] = "Inconnu"
 
     as_name_set = set(as_df["name"].dropna().astype(str)) if "name" in as_df.columns else set()
 
     if "assistant_name" in df.columns and "name" in as_df.columns:
+        available_agent_cols = [c for c in ["name", "settings", "modelId", "providerId", "provider"] if c in as_df.columns]
         df = df.merge(
-            as_df[["name", "settings", "modelId", "providerId", "provider"]],
+            as_df[available_agent_cols],
             left_on="assistant_name",
             right_on="name",
             how="left",
-            suffixes=("", "_agent")
+            suffixes=("", "_agent"),
         )
 
     published_mask = df["assistant_settings"].isin(["published", "unpublished"])
@@ -295,9 +300,11 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
         need = is_agent & df["statut_publication"].isin(["unknown", "N/A"])
         df.loc[need, "statut_publication"] = df.loc[need, "settings"].astype(str).str.lower()
 
-    df.loc[is_agent, "statut_publication"] = df.loc[is_agent, "statut_publication"].replace(
-        {"nan": "inconnu", "unknown": "inconnu", "": "inconnu"}
-    ).fillna("inconnu")
+    df.loc[is_agent, "statut_publication"] = (
+        df.loc[is_agent, "statut_publication"]
+        .replace({"nan": "inconnu", "unknown": "inconnu", "": "inconnu"})
+        .fillna("inconnu")
+    )
 
     base_mask = df["type_usage"].eq("LLM de base")
 
@@ -308,13 +315,16 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     else:
         base_model = pd.Series([""] * len(df), index=df.index)
 
-    base_model = base_model.fillna(df.get("assistant_name"))
+    if "assistant_name" in df.columns:
+        base_model = base_model.fillna(df["assistant_name"])
 
     df["llm_modele"] = "Inconnu"
     df.loc[base_mask, "llm_modele"] = base_model.loc[base_mask].astype(str)
 
     if "modelId" in df.columns:
-        df.loc[~base_mask, "llm_modele"] = df.loc[~base_mask, "modelId"].astype(str).replace({"nan": "Inconnu"})
+        df.loc[~base_mask, "llm_modele"] = (
+            df.loc[~base_mask, "modelId"].astype(str).replace({"nan": "Inconnu"})
+        )
     else:
         df.loc[~base_mask, "llm_modele"] = "Inconnu"
 
@@ -339,7 +349,7 @@ def compute_kpis(
     msgs_df: pd.DataFrame,
     membres_total: int,
     seuil_actif_messages: int,
-    cout_periode_ttc: float
+    cout_periode_ttc: float,
 ) -> Dict[str, Any]:
     users_total = int(len(users_df))
 
@@ -434,7 +444,7 @@ def main() -> None:
         include_inactive = st.checkbox(
             "Inclure les utilisateurs inactifs (messageCount = 0)",
             value=True,
-            help="Recommandé pour identifier les comptes à réactiver/désactiver."
+            help="Recommandé pour identifier les comptes à réactiver/désactiver.",
         )
         output_format = st.selectbox("Format", options=["csv", "json"], index=0)
 
@@ -442,17 +452,16 @@ def main() -> None:
         st.subheader("Définition 'actif'")
         seuil_actif = st.slider(
             "Seuil messages sur la période",
-            min_value=1, max_value=50, value=1, step=1
+            min_value=1,
+            max_value=50,
+            value=1,
+            step=1,
         )
 
         st.divider()
-        st.subheader("Coûts (TTC)")
-        mensuel_ht = st.number_input("Abonnement mensuel HT (€)", value=3683.0, step=50.0)
+        st.subheader("Coûts (calculés par membre)")
+        prix_unitaire_ht = st.number_input("Prix mensuel HT par membre (€)", value=29.0, step=1.0)
         tva_pct = st.number_input("TVA (%)", value=22.0, step=1.0)
-        membres_total = st.number_input("Nombre de membres (abonnés)", value=127, step=1)
-
-        cout_periode = cout_ttc_periode(mode, start_ym, end_ym, mensuel_ht, tva_pct)
-        st.caption(f"Coût TTC période (approx.) : **{cout_periode:,.2f} €**")
 
         st.divider()
         colA, colB = st.columns(2)
@@ -504,13 +513,26 @@ def main() -> None:
     msgs_df = normalize_messages(msgs_raw)
     msgs_enriched = enrich_messages(users_df, msgs_df, as_df)
 
+    membres_total = int(users_df["user_id"].nunique()) if "user_id" in users_df.columns else int(len(users_df))
+
+    cout_periode = cout_ttc_periode_par_membres(
+        mode=mode,
+        start_ym=start_ym,
+        end_ym=end_ym,
+        membres_total=membres_total,
+        prix_unitaire_ht=float(prix_unitaire_ht),
+        tva_pct=float(tva_pct),
+    )
+
     kpis = compute_kpis(
         users_df=users_df,
         msgs_df=msgs_enriched,
-        membres_total=int(membres_total),
+        membres_total=membres_total,
         seuil_actif_messages=int(seuil_actif),
         cout_periode_ttc=float(cout_periode),
     )
+
+    st.caption(f"Coût TTC période calculé sur {membres_total} membres : **{cout_periode:,.2f} €**")
 
     t_resume, t_agents, t_llm, t_users, t_data = st.tabs([
         "Résumé ROI",
@@ -526,12 +548,13 @@ def main() -> None:
     with t_resume:
         st.subheader("KPI principaux")
 
-        a1, a2, a3, a4, a5 = st.columns(5)
-        a1.metric("Membres (plan)", f"{kpis['membres_total']:,}")
-        a2.metric("Utilisateurs actifs", f"{kpis['users_actifs']:,}")
-        a3.metric("Utilisateurs à 0", f"{kpis['users_zero']:,}")
-        a4.metric("Taux d’activation", f"{kpis['taux_activation_pct']:.1f}%")
-        a5.metric("Messages (assistant)", f"{kpis['messages_total']:,}")
+        a1, a2, a3, a4, a5, a6 = st.columns(6)
+        a1.metric("Membres (période)", f"{kpis['membres_total']:,}")
+        a2.metric("Utilisateurs observés", f"{kpis['users_total']:,}")
+        a3.metric("Utilisateurs actifs", f"{kpis['users_actifs']:,}")
+        a4.metric("Utilisateurs à 0", f"{kpis['users_zero']:,}")
+        a5.metric("Taux d’activation", f"{kpis['taux_activation_pct']:.1f}%")
+        a6.metric("Messages (assistant)", f"{kpis['messages_total']:,}")
 
         b1, b2, b3, b4, b5 = st.columns(5)
         b1.metric("Coût TTC période", f"{kpis['cout_periode_ttc']:,.2f} €")
@@ -556,7 +579,7 @@ def main() -> None:
                 names="type_usage",
                 values="messages",
                 hole=0.45,
-                title="Part d’usage — Agents vs LLM de base"
+                title="Part d’usage — Agents vs LLM de base",
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -579,13 +602,10 @@ def main() -> None:
             st.plotly_chart(fig4, use_container_width=True)
 
         st.divider()
-        st.subheader("Top utilisateurs")
+        st.subheader("Top 30 utilisateurs")
 
         if "user_label" in msgs_enriched.columns:
-            agg_dict = {
-                "messages": ("user_label", "size"),
-            }
-
+            agg_dict = {"messages": ("user_label", "size")}
             if "conversation_id" in msgs_enriched.columns:
                 agg_dict["conversations"] = ("conversation_id", "nunique")
             if "jour" in msgs_enriched.columns:
@@ -611,12 +631,14 @@ def main() -> None:
                     if c in top_users.columns
                 ]
                 st.dataframe(
-                    top_users[display_cols].rename(columns={
-                        "user_label": "utilisateur",
-                        "part_messages_pct": "% du total",
-                    }),
+                    top_users[display_cols].rename(
+                        columns={
+                            "user_label": "utilisateur",
+                            "part_messages_pct": "% du total",
+                        }
+                    ),
                     use_container_width=True,
-                    height=700
+                    height=700,
                 )
 
             with top_cols_right:
@@ -625,7 +647,7 @@ def main() -> None:
                     x="messages",
                     y="user_label",
                     orientation="h",
-                    title="Top 30 utilisateurs par nombre de messages"
+                    title="Top 30 utilisateurs par nombre de messages",
                 )
                 st.plotly_chart(fig_top_users, use_container_width=True)
         else:
@@ -660,17 +682,21 @@ def main() -> None:
 
             if "messages" in as_df.columns and "settings" in as_df.columns:
                 published_unused = as_df[
-                    (as_df["settings"].astype(str).str.lower() == "published") & (as_df["messages"] == 0)
+                    (as_df["settings"].astype(str).str.lower() == "published")
+                    & (as_df["messages"] == 0)
                 ]
                 st.markdown(f"**Agents publiés non utilisés** : {len(published_unused):,}")
                 if len(published_unused) > 0:
-                    st.dataframe(
-                        published_unused[[
+                    cols = [
+                        c for c in [
                             "name", "provider", "modelId", "messages",
                             "distinctUsersReached", "distinctConversations", "lastEdit"
-                        ]],
+                        ] if c in published_unused.columns
+                    ]
+                    st.dataframe(
+                        published_unused[cols],
                         use_container_width=True,
-                        height=260
+                        height=260,
                     )
 
             if {"distinctUsersReached", "messages"}.issubset(set(as_df.columns)):
@@ -681,7 +707,7 @@ def main() -> None:
                     color="settings" if "settings" in as_df.columns else None,
                     size="distinctConversations" if "distinctConversations" in as_df.columns else None,
                     hover_name="name" if "name" in as_df.columns else None,
-                    title="Adoption agents : utilisateurs atteints vs volume (messages)"
+                    title="Adoption agents : utilisateurs atteints vs volume (messages)",
                 )
                 st.plotly_chart(fig3, use_container_width=True)
 
@@ -703,7 +729,13 @@ def main() -> None:
             else:
                 fam = base_msgs["llm_famille"].value_counts().reset_index()
                 fam.columns = ["famille", "messages"]
-                fig = px.pie(fam, names="famille", values="messages", hole=0.45, title="Répartition familles — LLM de base")
+                fig = px.pie(
+                    fam,
+                    names="famille",
+                    values="messages",
+                    hole=0.45,
+                    title="Répartition familles — LLM de base",
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
                 top = base_msgs["llm_modele"].value_counts().head(20).reset_index()
@@ -718,7 +750,13 @@ def main() -> None:
             else:
                 fam2 = agents_msgs["llm_famille"].value_counts().reset_index()
                 fam2.columns = ["famille", "messages"]
-                fig3 = px.pie(fam2, names="famille", values="messages", hole=0.45, title="Répartition familles — via agents")
+                fig3 = px.pie(
+                    fam2,
+                    names="famille",
+                    values="messages",
+                    hole=0.45,
+                    title="Répartition familles — via agents",
+                )
                 st.plotly_chart(fig3, use_container_width=True)
 
                 top2 = agents_msgs["llm_modele"].value_counts().head(20).reset_index()
@@ -747,7 +785,12 @@ def main() -> None:
             zeros = users_local[users_local["messageCount"] == 0].copy()
             st.markdown(f"### Utilisateurs à **0** sur la période : **{len(zeros):,}**")
 
-            cols = [c for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"] if c in zeros.columns]
+            cols = [
+                c for c in [
+                    "user_id", "user_name", "messageCount",
+                    "activeDaysCount", "lastMessageSent", "groups"
+                ] if c in zeros.columns
+            ]
             show_zeros = zeros[cols].copy() if cols else zeros
 
             if "groups" in show_zeros.columns:
@@ -762,7 +805,7 @@ def main() -> None:
                 "Télécharger la liste (CSV) — utilisateurs à 0",
                 data=csv_zeros,
                 file_name="utilisateurs_zero.csv",
-                mime="text/csv"
+                mime="text/csv",
             )
 
             st.divider()
@@ -791,53 +834,64 @@ def main() -> None:
         st.subheader("Exports (sans emails)")
 
         st.markdown("### assistant_messages (nettoyé)")
-        keep = [c for c in [
-            "created_at", "jour", "conversation_id", "message_id",
-            "user_id", "user_label",
-            "assistant_name", "assistant_id",
-            "assistant_settings", "type_usage", "statut_publication",
-            "llm_famille", "llm_modele", "source"
-        ] if c in msgs_enriched.columns]
+        keep = [
+            c for c in [
+                "created_at", "jour", "conversation_id", "message_id",
+                "user_id", "user_label",
+                "assistant_name", "assistant_id",
+                "assistant_settings", "type_usage", "statut_publication",
+                "llm_famille", "llm_modele", "source",
+            ] if c in msgs_enriched.columns
+        ]
 
         st.dataframe(msgs_enriched[keep].head(300), use_container_width=True, height=420)
         st.download_button(
             "Télécharger assistant_messages_clean.csv",
             data=msgs_enriched[keep].to_csv(index=False).encode("utf-8"),
             file_name="assistant_messages_clean.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
         st.divider()
         st.markdown("### users (sans affichage email)")
-        keep_u = [c for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"] if c in users_df.columns]
+        keep_u = [
+            c for c in [
+                "user_id", "user_name", "messageCount",
+                "activeDaysCount", "lastMessageSent", "groups"
+            ] if c in users_df.columns
+        ]
         st.dataframe(
-            users_df[keep_u].sort_values("messageCount", ascending=False) if "messageCount" in users_df.columns else users_df[keep_u],
+            users_df[keep_u].sort_values("messageCount", ascending=False)
+            if "messageCount" in users_df.columns else users_df[keep_u],
             use_container_width=True,
-            height=420
+            height=420,
         )
         st.download_button(
             "Télécharger users_clean.csv",
             data=users_df[keep_u].to_csv(index=False).encode("utf-8"),
             file_name="users_clean.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
         st.divider()
         st.markdown("### assistants (catalogue)")
-        keep_a = [c for c in [
-            "name", "description", "settings", "provider", "modelId",
-            "messages", "distinctUsersReached", "distinctConversations", "lastEdit"
-        ] if c in as_df.columns]
+        keep_a = [
+            c for c in [
+                "name", "description", "settings", "provider", "modelId",
+                "messages", "distinctUsersReached", "distinctConversations", "lastEdit"
+            ] if c in as_df.columns
+        ]
         st.dataframe(
-            as_df[keep_a].sort_values("messages", ascending=False) if "messages" in as_df.columns else as_df[keep_a],
+            as_df[keep_a].sort_values("messages", ascending=False)
+            if "messages" in as_df.columns else as_df[keep_a],
             use_container_width=True,
-            height=420
+            height=420,
         )
         st.download_button(
             "Télécharger assistants.csv",
             data=as_df[keep_a].to_csv(index=False).encode("utf-8"),
             file_name="assistants.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
 
