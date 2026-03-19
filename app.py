@@ -364,16 +364,16 @@ def assign_user_segment(message_count: int) -> str:
 
 def regularity_bucket_from_pct(pct: float) -> str:
     if pct <= 0:
-        return "0%"
+        return "0 % des semaines"
     if pct <= 25:
-        return "1–25%"
+        return "1 à 25 %"
     if pct <= 50:
-        return "26–50%"
+        return "26 à 50 %"
     if pct <= 75:
-        return "51–75%"
+        return "51 à 75 %"
     if pct < 100:
-        return "76–99%"
-    return "100%"
+        return "76 à 99 %"
+    return "100 % des semaines"
 
 
 def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFrame) -> pd.DataFrame:
@@ -392,7 +392,7 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
         users["semaines_actives"] = 0
         users["semaines_periode"] = 0
         users["taux_couverture_semaines_pct"] = 0.0
-        users["regularite_periode"] = "0%"
+        users["regularite_periode"] = "0 % des semaines"
         return users
 
     df = msgs_df.copy().dropna(subset=["created_at"])
@@ -400,7 +400,7 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
         users["semaines_actives"] = 0
         users["semaines_periode"] = 0
         users["taux_couverture_semaines_pct"] = 0.0
-        users["regularite_periode"] = "0%"
+        users["regularite_periode"] = "0 % des semaines"
         return users
 
     iso = df["created_at"].dt.isocalendar()
@@ -879,7 +879,7 @@ def main() -> None:
         nb_faible = int((users_seg["segment_usage"] == "Faible (1–3)").sum())
         nb_moyen = int((users_seg["segment_usage"] == "Moyen (4–20)").sum())
         nb_fort = int((users_seg["segment_usage"] == "Fort (>20)").sum())
-        nb_reguliers_max = int((users_seg["regularite_periode"] == "100%").sum()) if "regularite_periode" in users_seg.columns else 0
+        nb_reguliers_max = int((users_seg["regularite_periode"] == "100 % des semaines").sum()) if "regularite_periode" in users_seg.columns else 0
 
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Inactifs", f"{nb_inactifs:,}")
@@ -932,7 +932,15 @@ def main() -> None:
             st.plotly_chart(fig_hist, use_container_width=True)
 
         with viz4:
-            regularity_order = ["0%", "1–25%", "26–50%", "51–75%", "76–99%", "100%"]
+            regularity_order = [
+                "0 % des semaines",
+                "1 à 25 %",
+                "26 à 50 %",
+                "51 à 75 %",
+                "76 à 99 %",
+                "100 % des semaines",
+            ]
+
             regularity_counts = (
                 users_seg["regularite_periode"]
                 .value_counts()
@@ -941,19 +949,26 @@ def main() -> None:
             )
             regularity_counts.columns = ["regularite", "utilisateurs"]
 
+            regularity_counts["regularite"] = pd.Categorical(
+                regularity_counts["regularite"],
+                categories=regularity_order,
+                ordered=True,
+            )
+
             fig_regularity = px.bar(
                 regularity_counts,
                 x="regularite",
                 y="utilisateurs",
+                category_orders={"regularite": regularity_order},
                 title="Régularité sur la période (% de semaines avec au moins 1 usage)"
             )
             st.plotly_chart(fig_regularity, use_container_width=True)
 
         st.info(
             "Lecture du graphique de régularité : "
-            "**100%** = l’utilisateur a utilisé Dust au moins une fois toutes les semaines de la période ; "
-            "**51–75%** = il a été actif sur environ la moitié à trois quarts des semaines ; "
-            "**0%** = aucun usage sur la période."
+            "**100 % des semaines** = l’utilisateur a utilisé Dust au moins une fois toutes les semaines de la période ; "
+            "**51 à 75 %** = il a été actif sur environ la moitié à trois quarts des semaines ; "
+            "**0 % des semaines** = aucun usage sur la période."
         )
 
         st.divider()
@@ -1013,7 +1028,7 @@ def main() -> None:
             )
 
         if "régularité période" in users_seg_display.columns:
-            weekly_regular = users_seg_display[users_seg_display["régularité période"] == "100%"]
+            weekly_regular = users_seg_display[users_seg_display["régularité période"] == "100 % des semaines"]
             st.download_button(
                 "Télécharger les utilisateurs réguliers 100% (CSV)",
                 data=weekly_regular.to_csv(index=False).encode("utf-8"),
