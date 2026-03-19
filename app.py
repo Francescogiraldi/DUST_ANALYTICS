@@ -204,8 +204,13 @@ def normalize_users(users_df: pd.DataFrame) -> pd.DataFrame:
 
     if "messageCount" in df.columns:
         df["messageCount"] = pd.to_numeric(df["messageCount"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["messageCount"] = 0
+
     if "activeDaysCount" in df.columns:
         df["activeDaysCount"] = pd.to_numeric(df["activeDaysCount"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["activeDaysCount"] = 0
 
     return df
 
@@ -236,8 +241,11 @@ def normalize_messages(msgs_df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["created_at"] = pd.NaT
 
-    df = df.dropna(subset=["created_at"])
-    df["jour"] = df["created_at"].dt.date
+    df = df.dropna(subset=["created_at"]).copy()
+    if not df.empty:
+        df["jour"] = df["created_at"].dt.date
+    else:
+        df["jour"] = pd.Series(dtype="object")
 
     if "user_email" in df.columns:
         df = df.drop(columns=["user_email"])
@@ -342,6 +350,89 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
 
 
 # ============================
+# Segmentation utilisateurs
+# ============================
+def assign_user_segment(message_count: int) -> str:
+    if int(message_count) == 0:
+        return "Inactifs (0)"
+    if 1 <= int(message_count) <= 3:
+        return "Faible (1–3)"
+    if 4 <= int(message_count) <= 20:
+        return "Moyen (4–20)"
+    return "Fort (>20)"
+
+
+def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFrame) -> pd.DataFrame:
+    users = users_df.copy()
+
+    if "user_name" in users.columns and "user_id" in users.columns:
+        users["user_label"] = users["user_name"].fillna(users["user_id"].astype(str))
+    elif "user_id" in users.columns:
+        users["user_label"] = users["user_id"].astype(str)
+    else:
+        users["user_label"] = "Inconnu"
+
+    users["segment_usage"] = users["messageCount"].apply(assign_user_segment)
+
+    if msgs_df.empty or "created_at" not in msgs_df.columns or "user_label" not in msgs_df.columns:
+        users["semaines_actives"] = 0
+        users["semaines_periode"] = 0
+        users["taux_couverture_semaines_pct"] = 0.0
+        users["actif_chaque_semaine"] = False
+        return users
+
+    df = msgs_df.copy().dropna(subset=["created_at"])
+    if df.empty:
+        users["semaines_actives"] = 0
+        users["semaines_periode"] = 0
+        users["taux_couverture_semaines_pct"] = 0.0
+        users["actif_chaque_semaine"] = False
+        return users
+
+    iso = df["created_at"].dt.isocalendar()
+    df["iso_year"] = iso.year.astype(int)
+    df["iso_week"] = iso.week.astype(int)
+    df["year_week"] = df["iso_year"].astype(str) + "-S" + df["iso_week"].astype(str).str.zfill(2)
+
+    total_weeks = int(df["year_week"].nunique())
+
+    weekly = (
+        df.groupby("user_label")
+        .agg(
+            semaines_actives=("year_week", "nunique"),
+            conversations_logs=("conversation_id", "nunique") if "conversation_id" in df.columns else ("user_label", "size"),
+            dernier_message_logs=("jour", "max") if "jour" in df.columns else ("created_at", "max"),
+            messages_logs=("user_label", "size"),
+        )
+        .reset_index()
+    )
+
+    users = users.merge(weekly, on="user_label", how="left")
+    users["semaines_actives"] = users["semaines_actives"].fillna(0).astype(int)
+    users["semaines_periode"] = total_weeks
+    users["taux_couverture_semaines_pct"] = (
+        100.0 * users["semaines_actives"] / max(1, total_weeks)
+    ).round(1)
+    users["actif_chaque_semaine"] = users["semaines_actives"] >= max(1, total_weeks)
+
+    if "lastMessageSent" in users.columns:
+        users["dernier_message"] = users["dernier_message_logs"].fillna(users["lastMessageSent"])
+    else:
+        users["dernier_message"] = users["dernier_message_logs"]
+
+    if "conversations_logs" in users.columns:
+        users["conversations"] = users["conversations_logs"].fillna(0).astype(int)
+    else:
+        users["conversations"] = 0
+
+    drop_cols = [c for c in ["conversations_logs", "dernier_message_logs", "messages_logs"] if c in users.columns]
+    if drop_cols:
+        users = users.drop(columns=drop_cols)
+
+    return users
+
+
+# ============================
 # KPIs orientés ROI
 # ============================
 def compute_kpis(
@@ -406,8 +497,8 @@ def compute_kpis(
 def main() -> None:
     st.title("Dust — Tableau de bord ROI & Usage")
     st.caption(
-        "Analyse ROI-oriented : utilisation réelle, adoption des agents (publiés/non publiés), "
-        "mix LLM (ChatGPT/Claude/…), et utilisateurs à zéro pour réactivation/désactivation."
+        "Analyse ROI-oriented : utilisation réelle, adoption des agents, mix LLM, "
+        "segmentation utilisateurs et réactivation des comptes inactifs."
     )
 
     api_key, w_id, base_url_secret = get_required_secrets()
@@ -524,6 +615,8 @@ def main() -> None:
         tva_pct=float(tva_pct),
     )
 
+    users_seg = compute_weekly_coverage_all_users(users_df, msgs_enriched)
+
     kpis = compute_kpis(
         users_df=users_df,
         msgs_df=msgs_enriched,
@@ -538,7 +631,7 @@ def main() -> None:
         "Résumé ROI",
         "Agents (publiés / non publiés)",
         "Modèles (LLM de base vs via agents)",
-        "Utilisateurs (zéro & ciblage)",
+        "Utilisateurs & segmentation",
         "Données & exports",
     ])
 
@@ -772,60 +865,150 @@ def main() -> None:
         st.plotly_chart(fig5, use_container_width=True)
 
     # ----------------------------
-    # Utilisateurs (zéro & ciblage)
+    # Utilisateurs & segmentation
     # ----------------------------
     with t_users:
-        st.subheader("Utilisateurs à zéro & segmentation (réactivation / désactivation)")
+        st.subheader("Utilisateurs & segmentation")
+        st.caption("Vue simple pour comprendre l’adoption : inactifs, faibles utilisateurs, moyens et forts.")
 
-        if "messageCount" not in users_df.columns:
-            st.info("Colonne 'messageCount' absente dans la table users : impossible d’identifier les zéros.")
-        else:
-            users_local = users_df.copy()
+        nb_inactifs = int((users_seg["segment_usage"] == "Inactifs (0)").sum())
+        nb_faible = int((users_seg["segment_usage"] == "Faible (1–3)").sum())
+        nb_moyen = int((users_seg["segment_usage"] == "Moyen (4–20)").sum())
+        nb_fort = int((users_seg["segment_usage"] == "Fort (>20)").sum())
+        nb_regulars = int(users_seg["actif_chaque_semaine"].sum()) if "actif_chaque_semaine" in users_seg.columns else 0
 
-            zeros = users_local[users_local["messageCount"] == 0].copy()
-            st.markdown(f"### Utilisateurs à **0** sur la période : **{len(zeros):,}**")
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Inactifs", f"{nb_inactifs:,}")
+        k2.metric("Faible (1–3)", f"{nb_faible:,}")
+        k3.metric("Moyen (4–20)", f"{nb_moyen:,}")
+        k4.metric("Fort (>20)", f"{nb_fort:,}")
+        k5.metric("Actifs chaque semaine", f"{nb_regulars:,}")
 
-            cols = [
-                c for c in [
-                    "user_id", "user_name", "messageCount",
-                    "activeDaysCount", "lastMessageSent", "groups"
-                ] if c in zeros.columns
-            ]
-            show_zeros = zeros[cols].copy() if cols else zeros
+        st.divider()
 
-            if "groups" in show_zeros.columns:
-                show_zeros = show_zeros.sort_values(by=["groups", "user_name"], na_position="last")
-            elif "user_name" in show_zeros.columns:
-                show_zeros = show_zeros.sort_values(by=["user_name"], na_position="last")
+        segment_order = ["Inactifs (0)", "Faible (1–3)", "Moyen (4–20)", "Fort (>20)"]
+        segment_counts = (
+            users_seg["segment_usage"]
+            .value_counts()
+            .reindex(segment_order, fill_value=0)
+            .reset_index()
+        )
+        segment_counts.columns = ["segment", "utilisateurs"]
 
-            st.dataframe(show_zeros, use_container_width=True, height=480)
+        viz1, viz2 = st.columns(2)
 
-            csv_zeros = show_zeros.to_csv(index=False).encode("utf-8")
+        with viz1:
+            fig_seg = px.bar(
+                segment_counts,
+                x="segment",
+                y="utilisateurs",
+                title="Répartition des utilisateurs par segment d’usage"
+            )
+            st.plotly_chart(fig_seg, use_container_width=True)
+
+        with viz2:
+            fig_donut = px.pie(
+                segment_counts,
+                names="segment",
+                values="utilisateurs",
+                hole=0.5,
+                title="Part des segments d’usage"
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+        viz3, viz4 = st.columns(2)
+
+        with viz3:
+            fig_hist = px.histogram(
+                users_seg,
+                x="messageCount",
+                nbins=30,
+                title="Distribution du nombre de messages par utilisateur"
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+        with viz4:
+            weekly_counts = (
+                users_seg["actif_chaque_semaine"]
+                .map({True: "Oui", False: "Non"})
+                .value_counts()
+                .reindex(["Oui", "Non"], fill_value=0)
+                .reset_index()
+            )
+            weekly_counts.columns = ["actif_chaque_semaine", "utilisateurs"]
+
+            fig_weekly = px.bar(
+                weekly_counts,
+                x="actif_chaque_semaine",
+                y="utilisateurs",
+                title="Utilisateurs ayant utilisé Dust au moins une fois chaque semaine"
+            )
+            st.plotly_chart(fig_weekly, use_container_width=True)
+
+        st.divider()
+        st.subheader("Liste globale des utilisateurs")
+
+        table_cols = [
+            c for c in [
+                "user_label",
+                "segment_usage",
+                "messageCount",
+                "activeDaysCount",
+                "conversations",
+                "semaines_actives",
+                "semaines_periode",
+                "taux_couverture_semaines_pct",
+                "actif_chaque_semaine",
+                "dernier_message",
+                "groups",
+            ] if c in users_seg.columns
+        ]
+
+        users_seg_display = users_seg[table_cols].copy().rename(columns={
+            "user_label": "utilisateur",
+            "segment_usage": "segment",
+            "messageCount": "messages",
+            "activeDaysCount": "jours_actifs",
+            "conversations": "conversations",
+            "semaines_actives": "semaines_actives",
+            "semaines_periode": "semaines_période",
+            "taux_couverture_semaines_pct": "% couverture semaines",
+            "actif_chaque_semaine": "actif_chaque_semaine",
+            "dernier_message": "dernier_message",
+            "groups": "groupe",
+        })
+
+        sort_col = "messages" if "messages" in users_seg_display.columns else users_seg_display.columns[0]
+        st.dataframe(
+            users_seg_display.sort_values(sort_col, ascending=False),
+            use_container_width=True,
+            height=520,
+        )
+
+        st.download_button(
+            "Télécharger la segmentation utilisateurs (CSV)",
+            data=users_seg_display.to_csv(index=False).encode("utf-8"),
+            file_name="users_segmentation.csv",
+            mime="text/csv",
+        )
+
+        if "segment" in users_seg_display.columns:
+            zeros = users_seg_display[users_seg_display["segment"] == "Inactifs (0)"]
             st.download_button(
-                "Télécharger la liste (CSV) — utilisateurs à 0",
-                data=csv_zeros,
-                file_name="utilisateurs_zero.csv",
+                "Télécharger les inactifs (CSV)",
+                data=zeros.to_csv(index=False).encode("utf-8"),
+                file_name="utilisateurs_inactifs.csv",
                 mime="text/csv",
             )
 
-            st.divider()
-            st.markdown("### Segmentation simple (messageCount)")
-
-            low = users_local[(users_local["messageCount"] >= 1) & (users_local["messageCount"] <= 3)]
-            mid = users_local[(users_local["messageCount"] >= 4) & (users_local["messageCount"] <= 20)]
-            high = users_local[users_local["messageCount"] > 20]
-
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Faible (1–3)", f"{len(low):,}")
-            s2.metric("Moyen (4–20)", f"{len(mid):,}")
-            s3.metric("Fort (>20)", f"{len(high):,}")
-
-            dist = users_local["messageCount"].value_counts().reset_index()
-            dist.columns = ["messageCount", "utilisateurs"]
-            dist = dist.sort_values("messageCount").head(80)
-
-            fig = px.bar(dist, x="messageCount", y="utilisateurs", title="Distribution (zoom sur 80 niveaux)")
-            st.plotly_chart(fig, use_container_width=True)
+        if "actif_chaque_semaine" in users_seg_display.columns:
+            weekly_regular = users_seg_display[users_seg_display["actif_chaque_semaine"] == True]
+            st.download_button(
+                "Télécharger les utilisateurs actifs chaque semaine (CSV)",
+                data=weekly_regular.to_csv(index=False).encode("utf-8"),
+                file_name="utilisateurs_actifs_chaque_semaine.csv",
+                mime="text/csv",
+            )
 
     # ----------------------------
     # Données & exports
