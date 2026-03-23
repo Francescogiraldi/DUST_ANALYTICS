@@ -44,15 +44,23 @@ def get_required_secrets() -> Tuple[str, str, str]:
 
 
 # ============================
-# Dates (YYYY-MM) & coûts TTC
+# Dates & coûts TTC
 # ============================
 def ym(d: date) -> str:
     return d.strftime("%Y-%m")
 
 
-def months_inclusive(start_ym: str, end_ym: str) -> int:
-    sy, sm = map(int, start_ym.split("-"))
-    ey, em = map(int, end_ym.split("-"))
+def ymd(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
+
+
+def months_inclusive(start_str: str, end_str: str) -> int:
+    def _to_year_month(s: str) -> Tuple[int, int]:
+        parts = s.split("-")
+        return int(parts[0]), int(parts[1])
+
+    sy, sm = _to_year_month(start_str)
+    ey, em = _to_year_month(end_str)
     return (ey - sy) * 12 + (em - sm) + 1
 
 
@@ -62,13 +70,17 @@ def cout_ttc_membre(prix_unitaire_ht: float, tva_pct: float) -> float:
 
 def cout_ttc_periode_par_membres(
     mode: str,
-    start_ym: str,
-    end_ym: Optional[str],
+    start_str: str,
+    end_str: Optional[str],
     membres_total: int,
     prix_unitaire_ht: float,
     tva_pct: float,
 ) -> float:
-    nb_mois = 1 if mode == "month" or not end_ym else months_inclusive(start_ym, end_ym)
+    if mode == "month" or not end_str:
+        nb_mois = 1
+    else:
+        nb_mois = months_inclusive(start_str, end_str)
+
     prix_unitaire_ttc = cout_ttc_membre(prix_unitaire_ht, tva_pct)
     return float(membres_total) * prix_unitaire_ttc * nb_mois
 
@@ -132,7 +144,6 @@ class UsageQuery:
     end: Optional[str]
     table: str
     include_inactive: bool
-    output_format: str
 
     def params(self) -> Dict[str, Any]:
         p: Dict[str, Any] = {
@@ -140,7 +151,6 @@ class UsageQuery:
             "mode": self.mode,
             "table": self.table,
             "includeInactive": str(self.include_inactive).lower(),
-            "format": self.output_format,
         }
         if self.mode == "range" and self.end:
             p["end"] = self.end
@@ -150,7 +160,6 @@ class UsageQuery:
 def parse_api_response(resp: requests.Response) -> pd.DataFrame:
     ctype = (resp.headers.get("Content-Type") or "").lower()
 
-    # Cas fréquent en mode "range" : l'API peut renvoyer un ZIP contenant plusieurs CSV
     if "application/zip" in ctype or resp.content[:2] == b"PK":
         z = zipfile.ZipFile(io.BytesIO(resp.content))
         csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
@@ -194,9 +203,25 @@ def parse_api_response(resp: requests.Response) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=15 * 60)
-def fetch_usage_df(base_url: str, w_id: str, api_key: str, q: UsageQuery) -> pd.DataFrame:
+def fetch_usage_df(
+    base_url: str,
+    w_id: str,
+    api_key: str,
+    q: UsageQuery,
+    output_format: str,
+) -> pd.DataFrame:
     url = f"{base_url.rstrip('/')}/api/v1/w/{w_id}/workspace-usage"
-    headers = {"Authorization": f"Bearer {api_key}"}
+
+    accept_map = {
+        "json": "application/json",
+        "csv": "text/csv",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": accept_map.get(output_format, "application/json"),
+    }
+
     resp = requests.get(url, headers=headers, params=q.params(), timeout=90)
 
     if resp.status_code == 403:
@@ -259,7 +284,6 @@ def normalize_messages(msgs_df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.dropna(subset=["created_at"]).copy()
 
-    # Garder un vrai datetime pour de meilleures visualisations Plotly
     if not df.empty:
         df["jour"] = df["created_at"].dt.floor("D")
     else:
@@ -350,7 +374,9 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     df.loc[base_mask, "llm_modele"] = base_model.loc[base_mask].astype(str)
 
     if "modelId" in df.columns:
-        df.loc[~base_mask, "llm_modele"] = df.loc[~base_mask, "modelId"].astype(str).replace({"nan": "Inconnu"})
+        df.loc[~base_mask, "llm_modele"] = (
+            df.loc[~base_mask, "modelId"].astype(str).replace({"nan": "Inconnu"})
+        )
     else:
         df.loc[~base_mask, "llm_modele"] = "Inconnu"
 
@@ -442,7 +468,9 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
     users = users.merge(weekly, on="user_label", how="left")
     users["semaines_actives"] = users["semaines_actives"].fillna(0).astype(int)
     users["semaines_periode"] = total_weeks
-    users["taux_couverture_semaines_pct"] = (100.0 * users["semaines_actives"] / max(1, total_weeks)).round(1)
+    users["taux_couverture_semaines_pct"] = (
+        100.0 * users["semaines_actives"] / max(1, total_weeks)
+    ).round(1)
     users["regularite_periode"] = users["taux_couverture_semaines_pct"].apply(regularity_bucket_from_pct)
 
     if "lastMessageSent" in users.columns:
@@ -544,18 +572,22 @@ def main() -> None:
         st.code(w_id)
 
         st.divider()
-        st.subheader("Période (mois)")
+        st.subheader("Période")
         mode = st.selectbox("Mode", options=["month", "range"], index=0)
 
         if mode == "month":
             d0 = st.date_input("Mois", value=date.today().replace(day=1))
-            start_ym = ym(d0)
-            end_ym = None
+            start_param = ym(d0)
+            end_param = None
         else:
-            d_start = st.date_input("Début (mois)", value=date.today().replace(day=1))
-            d_end = st.date_input("Fin (mois)", value=date.today().replace(day=1))
-            start_ym = ym(min(d_start, d_end))
-            end_ym = ym(max(d_start, d_end))
+            d_start = st.date_input("Début", value=date.today().replace(day=1))
+            d_end = st.date_input("Fin", value=date.today())
+
+            real_start = min(d_start, d_end)
+            real_end = max(d_start, d_end)
+
+            start_param = ymd(real_start)
+            end_param = ymd(real_end)
 
         st.divider()
         st.subheader("Extraction")
@@ -564,7 +596,7 @@ def main() -> None:
             value=True,
             help="Recommandé pour identifier les comptes à réactiver/désactiver.",
         )
-        output_format = st.selectbox("Format", options=["csv", "json"], index=0)
+        output_format = st.selectbox("Format", options=["json", "csv"], index=0)
 
         st.divider()
         st.subheader("Définition 'actif'")
@@ -596,33 +628,30 @@ def main() -> None:
     with st.spinner("Appel API Dust…"):
         q_users = UsageQuery(
             mode=mode,
-            start=start_ym,
-            end=end_ym,
+            start=start_param,
+            end=end_param,
             table="users",
             include_inactive=include_inactive,
-            output_format=output_format,
         )
         q_msgs = UsageQuery(
             mode=mode,
-            start=start_ym,
-            end=end_ym,
+            start=start_param,
+            end=end_param,
             table="assistant_messages",
             include_inactive=include_inactive,
-            output_format=output_format,
         )
         q_as = UsageQuery(
             mode=mode,
-            start=start_ym,
-            end=end_ym,
+            start=start_param,
+            end=end_param,
             table="assistants",
             include_inactive=include_inactive,
-            output_format=output_format,
         )
 
         try:
-            users_raw = fetch_usage_df(base_url, w_id, api_key, q_users)
-            msgs_raw = fetch_usage_df(base_url, w_id, api_key, q_msgs)
-            as_raw = fetch_usage_df(base_url, w_id, api_key, q_as)
+            users_raw = fetch_usage_df(base_url, w_id, api_key, q_users, output_format)
+            msgs_raw = fetch_usage_df(base_url, w_id, api_key, q_msgs, output_format)
+            as_raw = fetch_usage_df(base_url, w_id, api_key, q_as, output_format)
         except Exception as e:
             st.error(f"Erreur lors du chargement : {e}")
             st.stop()
@@ -633,10 +662,11 @@ def main() -> None:
     msgs_enriched = enrich_messages(users_df, msgs_df, as_df)
 
     membres_total = int(users_df["user_id"].nunique()) if "user_id" in users_df.columns else int(len(users_df))
+
     cout_periode = cout_ttc_periode_par_membres(
         mode=mode,
-        start_ym=start_ym,
-        end_ym=end_ym,
+        start_str=start_param,
+        end_str=end_param,
         membres_total=membres_total,
         prix_unitaire_ht=float(prix_unitaire_ht),
         tva_pct=float(tva_pct),
@@ -664,9 +694,6 @@ def main() -> None:
         ]
     )
 
-    # ----------------------------
-    # Résumé ROI
-    # ----------------------------
     with t_resume:
         st.subheader("KPI principaux")
 
@@ -802,9 +829,6 @@ def main() -> None:
         else:
             st.info("Impossible de calculer le top utilisateurs : colonne user_label absente ou aucune donnée.")
 
-    # ----------------------------
-    # Agents
-    # ----------------------------
     with t_agents:
         st.subheader("Agents — usage & gouvernance (publiés / non publiés)")
 
@@ -857,9 +881,6 @@ def main() -> None:
                     height=260,
                 )
 
-    # ----------------------------
-    # Modèles
-    # ----------------------------
     with t_llm:
         st.subheader("Comparatif modèles — LLM de base vs via agents")
 
@@ -933,9 +954,6 @@ def main() -> None:
         else:
             st.info("Aucune tendance journalière disponible pour les familles LLM.")
 
-    # ----------------------------
-    # Utilisateurs & segmentation
-    # ----------------------------
     with t_users:
         st.subheader("Utilisateurs & segmentation")
         st.caption(
@@ -1105,9 +1123,6 @@ def main() -> None:
                 mime="text/csv",
             )
 
-    # ----------------------------
-    # Données & exports
-    # ----------------------------
     with t_data:
         st.subheader("Exports (sans emails)")
 
