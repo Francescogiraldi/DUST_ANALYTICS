@@ -32,12 +32,14 @@ def get_required_secrets() -> Tuple[str, str, str]:
     api_key = _secret("DUST_API_KEY")
     w_id = _secret("DUST_WORKSPACE_ID")
     base_url = _secret("DUST_BASE_URL") or "https://dust.tt"
+
     if not api_key or not w_id:
         st.error(
             "Secrets manquants : ajoute **DUST_API_KEY** et **DUST_WORKSPACE_ID** dans "
             "Streamlit Cloud → Settings → Secrets."
         )
         st.stop()
+
     return api_key, w_id, base_url
 
 
@@ -84,9 +86,11 @@ def is_na(x: Any) -> bool:
 def provider_label_from_provider_id(provider_id: Any) -> str:
     if is_na(provider_id):
         return "Inconnu"
+
     s = str(provider_id).strip()
     if not s or s.lower() == "nan":
         return "Inconnu"
+
     mapping = {
         "openai": "OpenAI (ChatGPT)",
         "anthropic": "Anthropic (Claude)",
@@ -100,9 +104,11 @@ def provider_label_from_provider_id(provider_id: Any) -> str:
 def provider_from_base_model(model_id: Any) -> str:
     if is_na(model_id):
         return "Autres"
+
     s = str(model_id).strip().lower()
     if not s or s == "nan":
         return "Autres"
+
     if "claude" in s:
         return "Anthropic (Claude)"
     if "gpt" in s or s.startswith(("o1", "o3")) or "openai" in s:
@@ -144,13 +150,23 @@ class UsageQuery:
 def parse_api_response(resp: requests.Response) -> pd.DataFrame:
     ctype = (resp.headers.get("Content-Type") or "").lower()
 
+    # Cas fréquent en mode "range" : l'API peut renvoyer un ZIP contenant plusieurs CSV
     if "application/zip" in ctype or resp.content[:2] == b"PK":
         z = zipfile.ZipFile(io.BytesIO(resp.content))
         csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+
         if not csv_names:
             return pd.DataFrame()
-        with z.open(csv_names[0]) as f:
-            return pd.read_csv(f)
+
+        dfs = []
+        for name in csv_names:
+            with z.open(name) as f:
+                dfs.append(pd.read_csv(f))
+
+        if not dfs:
+            return pd.DataFrame()
+
+        return pd.concat(dfs, ignore_index=True)
 
     if "text/csv" in ctype:
         return pd.read_csv(io.StringIO(resp.text))
@@ -242,10 +258,12 @@ def normalize_messages(msgs_df: pd.DataFrame) -> pd.DataFrame:
         df["created_at"] = pd.NaT
 
     df = df.dropna(subset=["created_at"]).copy()
+
+    # Garder un vrai datetime pour de meilleures visualisations Plotly
     if not df.empty:
-        df["jour"] = df["created_at"].dt.date
+        df["jour"] = df["created_at"].dt.floor("D")
     else:
-        df["jour"] = pd.Series(dtype="object")
+        df["jour"] = pd.Series(dtype="datetime64[ns]")
 
     if "user_email" in df.columns:
         df = df.drop(columns=["user_email"])
@@ -263,7 +281,8 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
 
     if "user_id" in df.columns and "user_id" in users_df.columns:
         available_user_cols = [
-            c for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"]
+            c
+            for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"]
             if c in users_df.columns
         ]
         df = df.merge(
@@ -295,8 +314,8 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     published_mask = df["assistant_settings"].isin(["published", "unpublished"])
     name_mask = df["assistant_name"].astype(str).isin(as_name_set) if "assistant_name" in df.columns else False
     joined_mask = df.get("providerId").notna() if "providerId" in df.columns else False
-
     is_agent = published_mask | name_mask | joined_mask
+
     df["type_usage"] = "LLM de base"
     df.loc[is_agent, "type_usage"] = "Agents personnalisés"
 
@@ -304,6 +323,7 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     df.loc[is_agent, "statut_publication"] = df.loc[is_agent, "assistant_settings"].replace(
         {"published": "published", "unpublished": "unpublished"}
     )
+
     if "settings" in df.columns:
         need = is_agent & df["statut_publication"].isin(["unknown", "N/A"])
         df.loc[need, "statut_publication"] = df.loc[need, "settings"].astype(str).str.lower()
@@ -330,9 +350,7 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     df.loc[base_mask, "llm_modele"] = base_model.loc[base_mask].astype(str)
 
     if "modelId" in df.columns:
-        df.loc[~base_mask, "llm_modele"] = (
-            df.loc[~base_mask, "modelId"].astype(str).replace({"nan": "Inconnu"})
-        )
+        df.loc[~base_mask, "llm_modele"] = df.loc[~base_mask, "modelId"].astype(str).replace({"nan": "Inconnu"})
     else:
         df.loc[~base_mask, "llm_modele"] = "Inconnu"
 
@@ -424,9 +442,7 @@ def compute_weekly_coverage_all_users(users_df: pd.DataFrame, msgs_df: pd.DataFr
     users = users.merge(weekly, on="user_label", how="left")
     users["semaines_actives"] = users["semaines_actives"].fillna(0).astype(int)
     users["semaines_periode"] = total_weeks
-    users["taux_couverture_semaines_pct"] = (
-        100.0 * users["semaines_actives"] / max(1, total_weeks)
-    ).round(1)
+    users["taux_couverture_semaines_pct"] = (100.0 * users["semaines_actives"] / max(1, total_weeks)).round(1)
     users["regularite_periode"] = users["taux_couverture_semaines_pct"].apply(regularity_bucket_from_pct)
 
     if "lastMessageSent" in users.columns:
@@ -466,7 +482,6 @@ def compute_kpis(
         active_users = int(msgs_df["user_id"].nunique()) if "user_id" in msgs_df.columns else 0
 
     taux_activation = 100.0 * active_users / max(1, int(membres_total))
-
     messages_total = int(len(msgs_df))
     conversations_total = int(msgs_df["conversation_id"].nunique()) if "conversation_id" in msgs_df.columns else 0
 
@@ -476,7 +491,6 @@ def compute_kpis(
 
     cout_par_membre = cout_periode_ttc / max(1, int(membres_total))
     cout_des_inactifs = cout_par_membre * zero_users
-
     cout_par_actif = (cout_periode_ttc / active_users) if active_users else None
     cout_par_message = (cout_periode_ttc / messages_total) if messages_total else None
     cout_par_conversation = (cout_periode_ttc / conversations_total) if conversations_total else None
@@ -531,7 +545,6 @@ def main() -> None:
 
         st.divider()
         st.subheader("Période (mois)")
-
         mode = st.selectbox("Mode", options=["month", "range"], index=0)
 
         if mode == "month":
@@ -571,6 +584,7 @@ def main() -> None:
         st.divider()
         colA, colB = st.columns(2)
         run = colA.button("Charger", use_container_width=True)
+
         if colB.button("Vider cache", use_container_width=True):
             st.cache_data.clear()
             st.toast("Cache vidé.")
@@ -619,7 +633,6 @@ def main() -> None:
     msgs_enriched = enrich_messages(users_df, msgs_df, as_df)
 
     membres_total = int(users_df["user_id"].nunique()) if "user_id" in users_df.columns else int(len(users_df))
-
     cout_periode = cout_ttc_periode_par_membres(
         mode=mode,
         start_ym=start_ym,
@@ -641,13 +654,15 @@ def main() -> None:
 
     st.caption(f"Coût TTC période calculé sur {membres_total} membres : **{cout_periode:,.2f} €**")
 
-    t_resume, t_agents, t_llm, t_users, t_data = st.tabs([
-        "Résumé ROI",
-        "Agents (publiés / non publiés)",
-        "Modèles (LLM de base vs via agents)",
-        "Utilisateurs & segmentation",
-        "Données & exports",
-    ])
+    t_resume, t_agents, t_llm, t_users, t_data = st.tabs(
+        [
+            "Résumé ROI",
+            "Agents (publiés / non publiés)",
+            "Modèles (LLM de base vs via agents)",
+            "Utilisateurs & segmentation",
+            "Données & exports",
+        ]
+    )
 
     # ----------------------------
     # Résumé ROI
@@ -679,39 +694,69 @@ def main() -> None:
         c1, c2 = st.columns(2)
 
         with c1:
-            split = msgs_enriched["type_usage"].value_counts().reset_index()
-            split.columns = ["type_usage", "messages"]
-            fig = px.pie(
-                split,
-                names="type_usage",
-                values="messages",
-                hole=0.45,
-                title="Part d’usage — Agents vs LLM de base",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            if not msgs_enriched.empty and "type_usage" in msgs_enriched.columns:
+                split = msgs_enriched["type_usage"].value_counts().reset_index()
+                split.columns = ["type_usage", "messages"]
+                fig = px.pie(
+                    split,
+                    names="type_usage",
+                    values="messages",
+                    hole=0.45,
+                    title="Part d’usage — Agents vs LLM de base",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Aucune donnée disponible pour la répartition Agents / LLM de base.")
 
         with c2:
-            fam = msgs_enriched["llm_famille"].value_counts().reset_index()
-            fam.columns = ["famille", "messages"]
-            fig2 = px.bar(fam, x="famille", y="messages", title="Messages par famille LLM (global)")
-            st.plotly_chart(fig2, use_container_width=True)
+            if not msgs_enriched.empty and "llm_famille" in msgs_enriched.columns:
+                fam = msgs_enriched["llm_famille"].value_counts().reset_index()
+                fam.columns = ["famille", "messages"]
+                fig2 = px.bar(fam, x="famille", y="messages", title="Messages par famille LLM (global)")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Aucune donnée disponible pour les familles LLM.")
 
         st.divider()
         st.subheader("Tendances (par jour)")
 
-        daily = msgs_enriched.groupby(["jour", "type_usage"]).size().reset_index(name="messages")
-        fig3 = px.area(daily, x="jour", y="messages", color="type_usage", title="Messages/jour — Agents vs LLM de base")
-        st.plotly_chart(fig3, use_container_width=True)
+        if not msgs_enriched.empty and {"jour", "type_usage"}.issubset(msgs_enriched.columns):
+            daily = (
+                msgs_enriched.groupby(["jour", "type_usage"])
+                .size()
+                .reset_index(name="messages")
+                .sort_values("jour")
+            )
+            fig3 = px.area(
+                daily,
+                x="jour",
+                y="messages",
+                color="type_usage",
+                title="Messages/jour — Agents vs LLM de base",
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("Aucune tendance journalière disponible.")
 
-        if "user_id" in msgs_enriched.columns:
-            dau = msgs_enriched.groupby("jour")["user_id"].nunique().reset_index(name="utilisateurs_actifs_jour")
-            fig4 = px.line(dau, x="jour", y="utilisateurs_actifs_jour", title="Utilisateurs actifs/jour (via logs)")
+        if not msgs_enriched.empty and {"jour", "user_id"}.issubset(msgs_enriched.columns):
+            dau = (
+                msgs_enriched.groupby("jour")["user_id"]
+                .nunique()
+                .reset_index(name="utilisateurs_actifs_jour")
+                .sort_values("jour")
+            )
+            fig4 = px.line(
+                dau,
+                x="jour",
+                y="utilisateurs_actifs_jour",
+                title="Utilisateurs actifs/jour (via logs)",
+            )
             st.plotly_chart(fig4, use_container_width=True)
 
         st.divider()
         st.subheader("Top 30 utilisateurs")
 
-        if "user_label" in msgs_enriched.columns:
+        if "user_label" in msgs_enriched.columns and not msgs_enriched.empty:
             agg_dict = {"messages": ("user_label", "size")}
             if "conversation_id" in msgs_enriched.columns:
                 agg_dict["conversations"] = ("conversation_id", "nunique")
@@ -733,10 +778,7 @@ def main() -> None:
             top_cols_left, top_cols_right = st.columns([1.2, 1])
 
             with top_cols_left:
-                display_cols = [
-                    c for c in ["user_label", "messages", "part_messages_pct", "conversations", "dernier_message"]
-                    if c in top_users.columns
-                ]
+                display_cols = [c for c in ["user_label", "messages", "part_messages_pct", "conversations", "dernier_message"] if c in top_users.columns]
                 st.dataframe(
                     top_users[display_cols].rename(
                         columns={
@@ -758,7 +800,7 @@ def main() -> None:
                 )
                 st.plotly_chart(fig_top_users, use_container_width=True)
         else:
-            st.info("Impossible de calculer le top utilisateurs : colonne `user_label` absente.")
+            st.info("Impossible de calculer le top utilisateurs : colonne user_label absente ou aucune donnée.")
 
     # ----------------------------
     # Agents
@@ -767,6 +809,7 @@ def main() -> None:
         st.subheader("Agents — usage & gouvernance (publiés / non publiés)")
 
         agents_msgs = msgs_enriched[msgs_enriched["type_usage"].eq("Agents personnalisés")].copy()
+
         if agents_msgs.empty:
             st.info("Aucun usage d’agent détecté sur la période.")
         else:
@@ -784,27 +827,35 @@ def main() -> None:
                 fig2 = px.bar(top_agents, x="agent", y="messages", title="Top 25 agents (messages)")
                 st.plotly_chart(fig2, use_container_width=True)
 
-            st.divider()
-            st.subheader("Catalogue agents (assistants) — adoption")
+        st.divider()
+        st.subheader("Catalogue agents (assistants) — adoption")
 
-            if "messages" in as_df.columns and "settings" in as_df.columns:
-                published_unused = as_df[
-                    (as_df["settings"].astype(str).str.lower() == "published")
-                    & (as_df["messages"] == 0)
-                ]
-                st.markdown(f"**Agents publiés non utilisés** : {len(published_unused):,}")
-                if len(published_unused) > 0:
-                    cols = [
-                        c for c in [
-                            "name", "provider", "modelId", "messages",
-                            "distinctUsersReached", "distinctConversations", "lastEdit"
-                        ] if c in published_unused.columns
+        if "messages" in as_df.columns and "settings" in as_df.columns:
+            published_unused = as_df[
+                (as_df["settings"].astype(str).str.lower() == "published")
+                & (as_df["messages"] == 0)
+            ]
+
+            st.markdown(f"**Agents publiés non utilisés** : {len(published_unused):,}")
+
+            if len(published_unused) > 0:
+                cols = [
+                    c for c in [
+                        "name",
+                        "provider",
+                        "modelId",
+                        "messages",
+                        "distinctUsersReached",
+                        "distinctConversations",
+                        "lastEdit",
                     ]
-                    st.dataframe(
-                        published_unused[cols],
-                        use_container_width=True,
-                        height=260,
-                    )
+                    if c in published_unused.columns
+                ]
+                st.dataframe(
+                    published_unused[cols],
+                    use_container_width=True,
+                    height=260,
+                )
 
     # ----------------------------
     # Modèles
@@ -819,6 +870,7 @@ def main() -> None:
 
         with col1:
             st.markdown("### LLM de base (usage direct)")
+
             if base_msgs.empty:
                 st.info("Aucun usage de LLM de base sur la période.")
             else:
@@ -840,6 +892,7 @@ def main() -> None:
 
         with col2:
             st.markdown("### Via agents (modèle sous-jacent)")
+
             if agents_msgs.empty:
                 st.info("Aucun usage via agents sur la période.")
             else:
@@ -862,9 +915,23 @@ def main() -> None:
         st.divider()
         st.subheader("Tendance familles (par jour)")
 
-        daily_fam = msgs_enriched.groupby(["jour", "llm_famille"]).size().reset_index(name="messages")
-        fig5 = px.area(daily_fam, x="jour", y="messages", color="llm_famille", title="Messages/jour — par famille LLM")
-        st.plotly_chart(fig5, use_container_width=True)
+        if not msgs_enriched.empty and {"jour", "llm_famille"}.issubset(msgs_enriched.columns):
+            daily_fam = (
+                msgs_enriched.groupby(["jour", "llm_famille"])
+                .size()
+                .reset_index(name="messages")
+                .sort_values("jour")
+            )
+            fig5 = px.area(
+                daily_fam,
+                x="jour",
+                y="messages",
+                color="llm_famille",
+                title="Messages/jour — par famille LLM",
+            )
+            st.plotly_chart(fig5, use_container_width=True)
+        else:
+            st.info("Aucune tendance journalière disponible pour les familles LLM.")
 
     # ----------------------------
     # Utilisateurs & segmentation
@@ -906,7 +973,7 @@ def main() -> None:
                 segment_counts,
                 x="segment",
                 y="utilisateurs",
-                title="Répartition des utilisateurs par segment d’usage"
+                title="Répartition des utilisateurs par segment d’usage",
             )
             st.plotly_chart(fig_seg, use_container_width=True)
 
@@ -916,7 +983,7 @@ def main() -> None:
                 names="segment",
                 values="utilisateurs",
                 hole=0.5,
-                title="Part des segments d’usage"
+                title="Part des segments d’usage",
             )
             st.plotly_chart(fig_donut, use_container_width=True)
 
@@ -927,7 +994,7 @@ def main() -> None:
                 users_seg,
                 x="messageCount",
                 nbins=30,
-                title="Distribution du nombre de messages par utilisateur"
+                title="Distribution du nombre de messages par utilisateur",
             )
             st.plotly_chart(fig_hist, use_container_width=True)
 
@@ -940,7 +1007,6 @@ def main() -> None:
                 "76 à 99 %",
                 "100 % des semaines",
             ]
-
             regularity_counts = (
                 users_seg["regularite_periode"]
                 .value_counts()
@@ -948,7 +1014,6 @@ def main() -> None:
                 .reset_index()
             )
             regularity_counts.columns = ["regularite", "utilisateurs"]
-
             regularity_counts["regularite"] = pd.Categorical(
                 regularity_counts["regularite"],
                 categories=regularity_order,
@@ -960,7 +1025,7 @@ def main() -> None:
                 x="regularite",
                 y="utilisateurs",
                 category_orders={"regularite": regularity_order},
-                title="Régularité sur la période (% de semaines avec au moins 1 usage)"
+                title="Régularité sur la période (% de semaines avec au moins 1 usage)",
             )
             st.plotly_chart(fig_regularity, use_container_width=True)
 
@@ -975,7 +1040,8 @@ def main() -> None:
         st.subheader("Liste globale des utilisateurs")
 
         table_cols = [
-            c for c in [
+            c
+            for c in [
                 "user_label",
                 "segment_usage",
                 "messageCount",
@@ -987,22 +1053,25 @@ def main() -> None:
                 "regularite_periode",
                 "dernier_message",
                 "groups",
-            ] if c in users_seg.columns
+            ]
+            if c in users_seg.columns
         ]
 
-        users_seg_display = users_seg[table_cols].copy().rename(columns={
-            "user_label": "utilisateur",
-            "segment_usage": "segment",
-            "messageCount": "messages",
-            "activeDaysCount": "jours_actifs",
-            "conversations": "conversations",
-            "semaines_actives": "semaines_actives",
-            "semaines_periode": "semaines_période",
-            "taux_couverture_semaines_pct": "% couverture semaines",
-            "regularite_periode": "régularité période",
-            "dernier_message": "dernier_message",
-            "groups": "groupe",
-        })
+        users_seg_display = users_seg[table_cols].copy().rename(
+            columns={
+                "user_label": "utilisateur",
+                "segment_usage": "segment",
+                "messageCount": "messages",
+                "activeDaysCount": "jours_actifs",
+                "conversations": "conversations",
+                "semaines_actives": "semaines_actives",
+                "semaines_periode": "semaines_période",
+                "taux_couverture_semaines_pct": "% couverture semaines",
+                "regularite_periode": "régularité période",
+                "dernier_message": "dernier_message",
+                "groups": "groupe",
+            }
+        )
 
         sort_col = "messages" if "messages" in users_seg_display.columns else users_seg_display.columns[0]
         st.dataframe(
@@ -1044,16 +1113,27 @@ def main() -> None:
 
         st.markdown("### assistant_messages (nettoyé)")
         keep = [
-            c for c in [
-                "created_at", "jour", "conversation_id", "message_id",
-                "user_id", "user_label",
-                "assistant_name", "assistant_id",
-                "assistant_settings", "type_usage", "statut_publication",
-                "llm_famille", "llm_modele", "source",
-            ] if c in msgs_enriched.columns
+            c
+            for c in [
+                "created_at",
+                "jour",
+                "conversation_id",
+                "message_id",
+                "user_id",
+                "user_label",
+                "assistant_name",
+                "assistant_id",
+                "assistant_settings",
+                "type_usage",
+                "statut_publication",
+                "llm_famille",
+                "llm_modele",
+                "source",
+            ]
+            if c in msgs_enriched.columns
         ]
-
         st.dataframe(msgs_enriched[keep].head(300), use_container_width=True, height=420)
+
         st.download_button(
             "Télécharger assistant_messages_clean.csv",
             data=msgs_enriched[keep].to_csv(index=False).encode("utf-8"),
@@ -1064,17 +1144,15 @@ def main() -> None:
         st.divider()
         st.markdown("### users (sans affichage email)")
         keep_u = [
-            c for c in [
-                "user_id", "user_name", "messageCount",
-                "activeDaysCount", "lastMessageSent", "groups"
-            ] if c in users_df.columns
+            c for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"]
+            if c in users_df.columns
         ]
         st.dataframe(
-            users_df[keep_u].sort_values("messageCount", ascending=False)
-            if "messageCount" in users_df.columns else users_df[keep_u],
+            users_df[keep_u].sort_values("messageCount", ascending=False) if "messageCount" in users_df.columns else users_df[keep_u],
             use_container_width=True,
             height=420,
         )
+
         st.download_button(
             "Télécharger users_clean.csv",
             data=users_df[keep_u].to_csv(index=False).encode("utf-8"),
@@ -1085,17 +1163,26 @@ def main() -> None:
         st.divider()
         st.markdown("### assistants (catalogue)")
         keep_a = [
-            c for c in [
-                "name", "description", "settings", "provider", "modelId",
-                "messages", "distinctUsersReached", "distinctConversations", "lastEdit"
-            ] if c in as_df.columns
+            c
+            for c in [
+                "name",
+                "description",
+                "settings",
+                "provider",
+                "modelId",
+                "messages",
+                "distinctUsersReached",
+                "distinctConversations",
+                "lastEdit",
+            ]
+            if c in as_df.columns
         ]
         st.dataframe(
-            as_df[keep_a].sort_values("messages", ascending=False)
-            if "messages" in as_df.columns else as_df[keep_a],
+            as_df[keep_a].sort_values("messages", ascending=False) if "messages" in as_df.columns else as_df[keep_a],
             use_container_width=True,
             height=420,
         )
+
         st.download_button(
             "Télécharger assistants.csv",
             data=as_df[keep_a].to_csv(index=False).encode("utf-8"),
