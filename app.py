@@ -707,11 +707,10 @@ def main() -> None:
 
     st.caption(f"Coût TTC période calculé sur {membres_total} membres : **{cout_periode:,.2f} €**")
 
-    t_resume, t_agents, t_agents_insights, t_llm, t_users, t_data = st.tabs(
+    t_resume, t_agents, t_llm, t_users, t_data = st.tabs(
         [
             "Résumé ROI",
-            "Agents (publiés / non publiés)",
-            "Agents Insights & Nouveaux Agents",
+            "Agents",
             "Modèles (LLM de base vs via agents)",
             "Utilisateurs & segmentation",
             "Données & exports",
@@ -857,68 +856,13 @@ def main() -> None:
             st.info("Impossible de calculer le top utilisateurs : colonne user_label absente ou aucune donnée.")
 
     # ----------------------------
-    # Agents
+    # Agents (onglet fusionné)
     # ----------------------------
     with t_agents:
-        st.subheader("Agents — usage & gouvernance (publiés / non publiés)")
-
-        agents_msgs = msgs_enriched[msgs_enriched["type_usage"].eq("Agents personnalisés")].copy()
-
-        if agents_msgs.empty:
-            st.info("Aucun usage d’agent détecté sur la période.")
-        else:
-            s1, s2 = st.columns(2)
-
-            with s1:
-                pub = agents_msgs["statut_publication"].value_counts().reset_index()
-                pub.columns = ["statut_publication", "messages"]
-                fig = px.bar(pub, x="statut_publication", y="messages", title="Messages — publié vs non publié (agents)")
-                st.plotly_chart(fig, use_container_width=True)
-
-            with s2:
-                top_agents = agents_msgs["assistant_name"].value_counts().head(25).reset_index()
-                top_agents.columns = ["agent", "messages"]
-                fig2 = px.bar(top_agents, x="agent", y="messages", title="Top 25 agents (messages)")
-                st.plotly_chart(fig2, use_container_width=True)
-
-        st.divider()
-        st.subheader("Catalogue agents (assistants) — adoption")
-
-        if "messages" in as_df.columns and "settings" in as_df.columns:
-            published_unused = as_df[
-                (as_df["settings"].astype(str).str.lower() == "published")
-                & (as_df["messages"] == 0)
-            ]
-
-            st.markdown(f"**Agents publiés non utilisés** : {len(published_unused):,}")
-
-            if len(published_unused) > 0:
-                cols = [
-                    c for c in [
-                        "name",
-                        "provider",
-                        "modelId",
-                        "messages",
-                        "distinctUsersReached",
-                        "distinctConversations",
-                        "lastEdit",
-                    ]
-                    if c in published_unused.columns
-                ]
-                st.dataframe(
-                    published_unused[cols],
-                    use_container_width=True,
-                    height=260,
-                )
-
-    # ----------------------------
-    # Agents Insights & Nouveaux Agents
-    # ----------------------------
-    with t_agents_insights:
-        st.subheader("Agents Insights & Nouveaux Agents")
+        st.subheader("Agents")
         st.caption(
-            "Vue portefeuille agents : adoption, usage, statut de publication, "
-            "nouveaux agents et opportunités d’action."
+            "Vue consolidée des agents : usage, statut publié / non publié, "
+            "nouveaux agents et portefeuille global."
         )
 
         agents_logs = msgs_enriched[msgs_enriched["type_usage"].eq("Agents personnalisés")].copy()
@@ -936,13 +880,6 @@ def main() -> None:
             agents_catalog["lastEdit_dt"] = pd.to_datetime(agents_catalog["lastEdit"], errors="coerce")
         else:
             agents_catalog["lastEdit_dt"] = pd.NaT
-
-        if "description" in agents_catalog.columns:
-            agents_catalog["description_len"] = (
-                agents_catalog["description"].fillna("").astype(str).str.len()
-            )
-        else:
-            agents_catalog["description_len"] = 0
 
         if agents_logs.empty or "assistant_name" not in agents_logs.columns:
             st.info("Aucun usage d’agent détecté sur la période.")
@@ -975,23 +912,10 @@ def main() -> None:
                 .rename(columns={"assistant_name": "name"})
             )
 
-            if "statut_publication" in agents_logs.columns:
-                status_mix = (
-                    agents_logs.groupby(["assistant_name", "statut_publication"])
-                    .size()
-                    .unstack(fill_value=0)
-                    .reset_index()
-                    .rename(columns={"assistant_name": "name"})
-                )
-                usage_agents = usage_agents.merge(status_mix, on="name", how="left")
-
             agents_portfolio = agents_catalog.merge(usage_agents, on="name", how="outer")
 
             if "settings" not in agents_portfolio.columns:
                 agents_portfolio["settings"] = "unknown"
-
-            if "description_len" not in agents_portfolio.columns:
-                agents_portfolio["description_len"] = 0
 
             if "lastEdit_dt" not in agents_portfolio.columns:
                 if "lastEdit" in agents_portfolio.columns:
@@ -1011,9 +935,6 @@ def main() -> None:
                 "utilisateurs_touches",
                 "conversations",
                 "jours_actifs",
-                "published",
-                "unpublished",
-                "description_len",
             ]:
                 if c in agents_portfolio.columns:
                     agents_portfolio[c] = pd.to_numeric(
@@ -1038,150 +959,19 @@ def main() -> None:
                 100.0 * agents_portfolio["utilisateurs_touches"] / max(1, int(kpis["users_total"]))
             ).round(1)
 
-            agents_portfolio["insight"] = ""
-
-            agents_portfolio.loc[
-                (agents_portfolio["statut_agent"] == "Publié")
-                & (agents_portfolio["messages_periode"] == 0),
-                "insight",
-            ] = "Publié sans usage"
-
-            agents_portfolio.loc[
-                (agents_portfolio["statut_agent"] == "Non publié")
-                & (agents_portfolio["messages_periode"] > 0),
-                "insight",
-            ] = "Usage non publié"
-
-            agents_portfolio.loc[
-                (agents_portfolio["messages_periode"] >= 50)
-                & (agents_portfolio["utilisateurs_touches"] <= 2),
-                "insight",
-            ] = "Usage concentré"
-
-            agents_portfolio.loc[
-                (agents_portfolio["description_len"] == 0)
-                & agents_portfolio["insight"].eq(""),
-                "insight",
-            ] = "Description vide"
-
-            published_used = int(
-                (
-                    (agents_portfolio["statut_agent"] == "Publié")
-                    & (agents_portfolio["messages_periode"] > 0)
-                ).sum()
-            )
-            published_unused = int(
-                (
-                    (agents_portfolio["statut_agent"] == "Publié")
-                    & (agents_portfolio["messages_periode"] == 0)
-                ).sum()
-            )
-            unpublished_used = int(
-                (
-                    (agents_portfolio["statut_agent"] == "Non publié")
-                    & (agents_portfolio["messages_periode"] > 0)
-                ).sum()
-            )
-            active_agents = int((agents_portfolio["messages_periode"] > 0).sum())
-
-            total_agent_messages = float(agents_portfolio["messages_periode"].sum())
-            top3_share = 0.0
-            if total_agent_messages > 0:
-                top3_share = round(
-                    100.0
-                    * agents_portfolio.sort_values("messages_periode", ascending=False)["messages_periode"]
-                    .head(3)
-                    .sum()
-                    / total_agent_messages,
-                    1,
-                )
-
-            new_agents = agents_portfolio[
-                agents_portfolio["lastEdit_dt"].notna()
-                & (agents_portfolio["lastEdit_dt"].dt.normalize() >= period_start_dt)
-                & (agents_portfolio["lastEdit_dt"].dt.normalize() <= period_end_dt)
-            ].copy()
-
-            i1, i2, i3, i4, i5 = st.columns(5)
-            i1.metric("Agents actifs", f"{active_agents:,}")
-            i2.metric("Publiés utilisés", f"{published_used:,}")
-            i3.metric("Publiés sans usage", f"{published_unused:,}")
-            i4.metric("Non publiés utilisés", f"{unpublished_used:,}")
-            i5.metric("Nouveaux / édités", f"{len(new_agents):,}")
-
-            if published_unused > 0:
-                st.warning(
-                    f"{published_unused} agent(s) publiés n'ont généré aucun message sur la période."
-                )
-            if unpublished_used > 0:
-                st.info(
-                    f"{unpublished_used} agent(s) non publiés ont été utilisés sur la période."
-                )
-            if top3_share >= 60:
-                st.info(
-                    f"L’usage des agents est concentré : les 3 premiers représentent {top3_share}% des messages agents."
-                )
-
-            st.divider()
-
-            c1, c2 = st.columns(2)
-
-            with c1:
-                status_summary = (
-                    agents_portfolio.groupby("statut_agent", dropna=False)
-                    .agg(
-                        agents=("name", "nunique"),
-                        messages=("messages_periode", "sum"),
-                    )
-                    .reset_index()
-                )
-                fig_status = px.bar(
-                    status_summary,
-                    x="statut_agent",
-                    y="messages",
-                    text="agents",
-                    title="Messages agents par statut de publication",
-                )
-                st.plotly_chart(fig_status, use_container_width=True)
-
-            with c2:
-                active_portfolio = agents_portfolio[
-                    agents_portfolio["messages_periode"] > 0
-                ].copy()
-
-                if not active_portfolio.empty:
-                    fig_portfolio = px.scatter(
-                        active_portfolio,
-                        x="utilisateurs_touches",
-                        y="messages_periode",
-                        size="conversations",
-                        color="statut_agent",
-                        hover_name="name",
-                        hover_data=[
-                            "adoption_pct",
-                            "messages_par_utilisateur",
-                            "jours_actifs",
-                            "insight",
-                        ],
-                        title="Portefeuille agents — adoption vs volume d’usage",
-                    )
-                    st.plotly_chart(fig_portfolio, use_container_width=True)
-                else:
-                    st.info("Pas assez de données pour afficher le portefeuille agents.")
-
-            st.divider()
-
+            # Top 15 agents
             g1, g2 = st.columns(2)
 
             with g1:
-                top_agents_insight = (
-                    agents_portfolio.sort_values("messages_periode", ascending=False)
+                top_agents_messages = (
+                    agents_portfolio[agents_portfolio["messages_periode"] > 0]
+                    .sort_values("messages_periode", ascending=False)
                     .head(15)
                     .copy()
                 )
-                if not top_agents_insight.empty:
+                if not top_agents_messages.empty:
                     fig_top_agents = px.bar(
-                        top_agents_insight.sort_values("messages_periode", ascending=True),
+                        top_agents_messages.sort_values("messages_periode", ascending=True),
                         x="messages_periode",
                         y="name",
                         orientation="h",
@@ -1189,18 +979,19 @@ def main() -> None:
                         title="Top 15 agents par messages",
                     )
                     st.plotly_chart(fig_top_agents, use_container_width=True)
+                else:
+                    st.info("Aucun agent avec messages sur la période.")
 
             with g2:
-                top_agents_adoption = (
-                    agents_portfolio.sort_values(
-                        ["utilisateurs_touches", "messages_periode"], ascending=False
-                    )
+                top_agents_users = (
+                    agents_portfolio[agents_portfolio["utilisateurs_touches"] > 0]
+                    .sort_values(["utilisateurs_touches", "messages_periode"], ascending=False)
                     .head(15)
                     .copy()
                 )
-                if not top_agents_adoption.empty:
+                if not top_agents_users.empty:
                     fig_top_adoption = px.bar(
-                        top_agents_adoption.sort_values("utilisateurs_touches", ascending=True),
+                        top_agents_users.sort_values("utilisateurs_touches", ascending=True),
                         x="utilisateurs_touches",
                         y="name",
                         orientation="h",
@@ -1208,101 +999,22 @@ def main() -> None:
                         title="Top 15 agents par utilisateurs touchés",
                     )
                     st.plotly_chart(fig_top_adoption, use_container_width=True)
+                else:
+                    st.info("Aucun agent avec utilisateurs touchés sur la période.")
 
             st.divider()
 
-            st.subheader("Insights actionnables")
-            a1, a2, a3 = st.columns(3)
-
-            with a1:
-                st.markdown("### À rationaliser")
-                published_no_usage_df = agents_portfolio[
-                    (agents_portfolio["statut_agent"] == "Publié")
-                    & (agents_portfolio["messages_periode"] == 0)
-                ].copy()
-                if published_no_usage_df.empty:
-                    st.success("Aucun agent publié sans usage.")
-                else:
-                    cols = [
-                        c
-                        for c in [
-                            "name",
-                            "statut_agent",
-                            "lastEdit_dt",
-                            "distinctUsersReached",
-                            "distinctConversations",
-                            "insight",
-                        ]
-                        if c in published_no_usage_df.columns
-                    ]
-                    st.dataframe(
-                        published_no_usage_df[cols].sort_values("lastEdit_dt", ascending=False),
-                        use_container_width=True,
-                        height=260,
-                    )
-
-            with a2:
-                st.markdown("### À gouverner")
-                unpublished_usage_df = agents_portfolio[
-                    (agents_portfolio["statut_agent"] == "Non publié")
-                    & (agents_portfolio["messages_periode"] > 0)
-                ].copy()
-                if unpublished_usage_df.empty:
-                    st.success("Aucun agent non publié utilisé.")
-                else:
-                    cols = [
-                        c
-                        for c in [
-                            "name",
-                            "messages_periode",
-                            "utilisateurs_touches",
-                            "conversations",
-                            "messages_par_utilisateur",
-                            "insight",
-                        ]
-                        if c in unpublished_usage_df.columns
-                    ]
-                    st.dataframe(
-                        unpublished_usage_df[cols].sort_values("messages_periode", ascending=False),
-                        use_container_width=True,
-                        height=260,
-                    )
-
-            with a3:
-                st.markdown("### À pousser")
-                high_potential_df = agents_portfolio[
-                    (agents_portfolio["messages_periode"] > 0)
-                    & (agents_portfolio["utilisateurs_touches"] >= 3)
-                ].copy()
-                if high_potential_df.empty:
-                    st.info("Pas encore d’agent avec adoption large sur la période.")
-                else:
-                    cols = [
-                        c
-                        for c in [
-                            "name",
-                            "statut_agent",
-                            "messages_periode",
-                            "utilisateurs_touches",
-                            "adoption_pct",
-                            "messages_par_utilisateur",
-                        ]
-                        if c in high_potential_df.columns
-                    ]
-                    st.dataframe(
-                        high_potential_df[cols].sort_values(
-                            ["utilisateurs_touches", "messages_periode"], ascending=False
-                        ),
-                        use_container_width=True,
-                        height=260,
-                    )
-
-            st.divider()
-
+            # Nouveaux agents
             st.subheader("Nouveaux Agents")
             st.caption(
                 "Proxy utilisé : `lastEdit` dans la période sélectionnée, faute d’un champ natif de création."
             )
+
+            new_agents = agents_portfolio[
+                agents_portfolio["lastEdit_dt"].notna()
+                & (agents_portfolio["lastEdit_dt"].dt.normalize() >= period_start_dt)
+                & (agents_portfolio["lastEdit_dt"].dt.normalize() <= period_end_dt)
+            ].copy()
 
             if new_agents.empty:
                 st.info("Aucun nouvel agent ou agent récemment édité sur la période.")
@@ -1324,7 +1036,6 @@ def main() -> None:
                             "utilisateurs_touches",
                             "conversations",
                             "adoption_pct",
-                            "insight",
                         ]
                         if c in new_agents.columns
                     ]
@@ -1338,7 +1049,6 @@ def main() -> None:
                                 "utilisateurs_touches": "utilisateurs",
                                 "conversations": "conversations",
                                 "adoption_pct": "adoption_%",
-                                "insight": "insight",
                             }
                         ),
                         use_container_width=True,
@@ -1351,14 +1061,16 @@ def main() -> None:
                         x="name",
                         y="messages_periode",
                         color="statut_agent",
-                        hover_data=["utilisateurs_touches", "lastEdit_dt", "insight"],
+                        hover_data=["utilisateurs_touches", "lastEdit_dt"],
                         title="Usage des nouveaux / récemment édités",
                     )
                     st.plotly_chart(fig_new_agents, use_container_width=True)
 
             st.divider()
 
+            # Table portefeuille agents
             st.subheader("Table portefeuille agents")
+
             portfolio_display_cols = [
                 c
                 for c in [
@@ -1373,7 +1085,6 @@ def main() -> None:
                     "lastEdit_dt",
                     "premier_usage",
                     "dernier_usage",
-                    "insight",
                 ]
                 if c in agents_portfolio.columns
             ]
@@ -1394,7 +1105,6 @@ def main() -> None:
                         "lastEdit_dt": "dernière_édition",
                         "premier_usage": "premier_usage",
                         "dernier_usage": "dernier_usage",
-                        "insight": "insight",
                     }
                 ),
                 use_container_width=True,
@@ -1404,7 +1114,7 @@ def main() -> None:
             st.download_button(
                 "Télécharger le portefeuille agents (CSV)",
                 data=agents_portfolio[portfolio_display_cols].to_csv(index=False).encode("utf-8"),
-                file_name="agents_insights_portefeuille.csv",
+                file_name="agents_portefeuille.csv",
                 mime="text/csv",
             )
 
