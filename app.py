@@ -135,6 +135,28 @@ def provider_from_base_model(model_id: Any) -> str:
 
 
 # ============================
+# Helpers agents / période
+# ============================
+def agent_status_from_settings(settings: Any) -> str:
+    s = str(settings).strip().lower()
+    if s == "published":
+        return "Publié"
+    if s == "unpublished":
+        return "Non publié"
+    return "Inconnu"
+
+
+def get_period_bounds(mode: str, start_param: str, end_param: Optional[str]) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    if mode == "month":
+        start = pd.to_datetime(f"{start_param}-01", errors="coerce").normalize()
+        end = (start + pd.offsets.MonthEnd(0)).normalize()
+    else:
+        start = pd.to_datetime(start_param, errors="coerce").normalize()
+        end = pd.to_datetime(end_param or start_param, errors="coerce").normalize()
+    return start, end
+
+
+# ============================
 # Appel API Dust
 # ============================
 @dataclass(frozen=True)
@@ -660,6 +682,7 @@ def main() -> None:
     as_df = normalize_assistants(as_raw)
     msgs_df = normalize_messages(msgs_raw)
     msgs_enriched = enrich_messages(users_df, msgs_df, as_df)
+    period_start_dt, period_end_dt = get_period_bounds(mode, start_param, end_param)
 
     membres_total = int(users_df["user_id"].nunique()) if "user_id" in users_df.columns else int(len(users_df))
 
@@ -684,16 +707,20 @@ def main() -> None:
 
     st.caption(f"Coût TTC période calculé sur {membres_total} membres : **{cout_periode:,.2f} €**")
 
-    t_resume, t_agents, t_llm, t_users, t_data = st.tabs(
+    t_resume, t_agents, t_agents_insights, t_llm, t_users, t_data = st.tabs(
         [
             "Résumé ROI",
             "Agents (publiés / non publiés)",
+            "Agents Insights & Nouveaux Agents",
             "Modèles (LLM de base vs via agents)",
             "Utilisateurs & segmentation",
             "Données & exports",
         ]
     )
 
+    # ----------------------------
+    # Résumé ROI
+    # ----------------------------
     with t_resume:
         st.subheader("KPI principaux")
 
@@ -829,6 +856,9 @@ def main() -> None:
         else:
             st.info("Impossible de calculer le top utilisateurs : colonne user_label absente ou aucune donnée.")
 
+    # ----------------------------
+    # Agents
+    # ----------------------------
     with t_agents:
         st.subheader("Agents — usage & gouvernance (publiés / non publiés)")
 
@@ -881,6 +911,506 @@ def main() -> None:
                     height=260,
                 )
 
+    # ----------------------------
+    # Agents Insights & Nouveaux Agents
+    # ----------------------------
+    with t_agents_insights:
+        st.subheader("Agents Insights & Nouveaux Agents")
+        st.caption(
+            "Vue portefeuille agents : adoption, usage, statut de publication, "
+            "nouveaux agents et opportunités d’action."
+        )
+
+        agents_logs = msgs_enriched[msgs_enriched["type_usage"].eq("Agents personnalisés")].copy()
+        agents_catalog = as_df.copy()
+
+        if "name" not in agents_catalog.columns:
+            agents_catalog["name"] = pd.Series(dtype="object")
+
+        if "settings" not in agents_catalog.columns:
+            agents_catalog["settings"] = "unknown"
+
+        agents_catalog["statut_agent"] = agents_catalog["settings"].apply(agent_status_from_settings)
+
+        if "lastEdit" in agents_catalog.columns:
+            agents_catalog["lastEdit_dt"] = pd.to_datetime(agents_catalog["lastEdit"], errors="coerce")
+        else:
+            agents_catalog["lastEdit_dt"] = pd.NaT
+
+        if "description" in agents_catalog.columns:
+            agents_catalog["description_len"] = (
+                agents_catalog["description"].fillna("").astype(str).str.len()
+            )
+        else:
+            agents_catalog["description_len"] = 0
+
+        if agents_logs.empty or "assistant_name" not in agents_logs.columns:
+            st.info("Aucun usage d’agent détecté sur la période.")
+        else:
+            usage_agg = {
+                "messages_periode": ("assistant_name", "size"),
+                "premier_usage": ("created_at", "min"),
+                "dernier_usage": ("created_at", "max"),
+            }
+
+            if "user_label" in agents_logs.columns:
+                usage_agg["utilisateurs_touches"] = ("user_label", "nunique")
+            else:
+                usage_agg["utilisateurs_touches"] = ("assistant_name", "size")
+
+            if "conversation_id" in agents_logs.columns:
+                usage_agg["conversations"] = ("conversation_id", "nunique")
+            else:
+                usage_agg["conversations"] = ("assistant_name", "size")
+
+            if "jour" in agents_logs.columns:
+                usage_agg["jours_actifs"] = ("jour", "nunique")
+            else:
+                usage_agg["jours_actifs"] = ("assistant_name", "size")
+
+            usage_agents = (
+                agents_logs.groupby("assistant_name")
+                .agg(**usage_agg)
+                .reset_index()
+                .rename(columns={"assistant_name": "name"})
+            )
+
+            if "statut_publication" in agents_logs.columns:
+                status_mix = (
+                    agents_logs.groupby(["assistant_name", "statut_publication"])
+                    .size()
+                    .unstack(fill_value=0)
+                    .reset_index()
+                    .rename(columns={"assistant_name": "name"})
+                )
+                usage_agents = usage_agents.merge(status_mix, on="name", how="left")
+
+            agents_portfolio = agents_catalog.merge(usage_agents, on="name", how="outer")
+
+            if "settings" not in agents_portfolio.columns:
+                agents_portfolio["settings"] = "unknown"
+
+            if "description_len" not in agents_portfolio.columns:
+                agents_portfolio["description_len"] = 0
+
+            if "lastEdit_dt" not in agents_portfolio.columns:
+                if "lastEdit" in agents_portfolio.columns:
+                    agents_portfolio["lastEdit_dt"] = pd.to_datetime(
+                        agents_portfolio["lastEdit"], errors="coerce"
+                    )
+                else:
+                    agents_portfolio["lastEdit_dt"] = pd.NaT
+
+            agents_portfolio["statut_agent"] = agents_portfolio["settings"].apply(agent_status_from_settings)
+
+            for c in [
+                "messages",
+                "distinctUsersReached",
+                "distinctConversations",
+                "messages_periode",
+                "utilisateurs_touches",
+                "conversations",
+                "jours_actifs",
+                "published",
+                "unpublished",
+                "description_len",
+            ]:
+                if c in agents_portfolio.columns:
+                    agents_portfolio[c] = pd.to_numeric(
+                        agents_portfolio[c], errors="coerce"
+                    ).fillna(0)
+
+            if "messages_periode" not in agents_portfolio.columns:
+                agents_portfolio["messages_periode"] = 0
+            if "utilisateurs_touches" not in agents_portfolio.columns:
+                agents_portfolio["utilisateurs_touches"] = 0
+            if "conversations" not in agents_portfolio.columns:
+                agents_portfolio["conversations"] = 0
+            if "jours_actifs" not in agents_portfolio.columns:
+                agents_portfolio["jours_actifs"] = 0
+
+            agents_portfolio["messages_par_utilisateur"] = (
+                agents_portfolio["messages_periode"]
+                / agents_portfolio["utilisateurs_touches"].replace(0, pd.NA)
+            ).fillna(0).round(1)
+
+            agents_portfolio["adoption_pct"] = (
+                100.0 * agents_portfolio["utilisateurs_touches"] / max(1, int(kpis["users_total"]))
+            ).round(1)
+
+            agents_portfolio["insight"] = ""
+
+            agents_portfolio.loc[
+                (agents_portfolio["statut_agent"] == "Publié")
+                & (agents_portfolio["messages_periode"] == 0),
+                "insight",
+            ] = "Publié sans usage"
+
+            agents_portfolio.loc[
+                (agents_portfolio["statut_agent"] == "Non publié")
+                & (agents_portfolio["messages_periode"] > 0),
+                "insight",
+            ] = "Usage non publié"
+
+            agents_portfolio.loc[
+                (agents_portfolio["messages_periode"] >= 50)
+                & (agents_portfolio["utilisateurs_touches"] <= 2),
+                "insight",
+            ] = "Usage concentré"
+
+            agents_portfolio.loc[
+                (agents_portfolio["description_len"] == 0)
+                & agents_portfolio["insight"].eq(""),
+                "insight",
+            ] = "Description vide"
+
+            published_used = int(
+                (
+                    (agents_portfolio["statut_agent"] == "Publié")
+                    & (agents_portfolio["messages_periode"] > 0)
+                ).sum()
+            )
+            published_unused = int(
+                (
+                    (agents_portfolio["statut_agent"] == "Publié")
+                    & (agents_portfolio["messages_periode"] == 0)
+                ).sum()
+            )
+            unpublished_used = int(
+                (
+                    (agents_portfolio["statut_agent"] == "Non publié")
+                    & (agents_portfolio["messages_periode"] > 0)
+                ).sum()
+            )
+            active_agents = int((agents_portfolio["messages_periode"] > 0).sum())
+
+            total_agent_messages = float(agents_portfolio["messages_periode"].sum())
+            top3_share = 0.0
+            if total_agent_messages > 0:
+                top3_share = round(
+                    100.0
+                    * agents_portfolio.sort_values("messages_periode", ascending=False)["messages_periode"]
+                    .head(3)
+                    .sum()
+                    / total_agent_messages,
+                    1,
+                )
+
+            new_agents = agents_portfolio[
+                agents_portfolio["lastEdit_dt"].notna()
+                & (agents_portfolio["lastEdit_dt"].dt.normalize() >= period_start_dt)
+                & (agents_portfolio["lastEdit_dt"].dt.normalize() <= period_end_dt)
+            ].copy()
+
+            i1, i2, i3, i4, i5 = st.columns(5)
+            i1.metric("Agents actifs", f"{active_agents:,}")
+            i2.metric("Publiés utilisés", f"{published_used:,}")
+            i3.metric("Publiés sans usage", f"{published_unused:,}")
+            i4.metric("Non publiés utilisés", f"{unpublished_used:,}")
+            i5.metric("Nouveaux / édités", f"{len(new_agents):,}")
+
+            if published_unused > 0:
+                st.warning(
+                    f"{published_unused} agent(s) publiés n'ont généré aucun message sur la période."
+                )
+            if unpublished_used > 0:
+                st.info(
+                    f"{unpublished_used} agent(s) non publiés ont été utilisés sur la période."
+                )
+            if top3_share >= 60:
+                st.info(
+                    f"L’usage des agents est concentré : les 3 premiers représentent {top3_share}% des messages agents."
+                )
+
+            st.divider()
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                status_summary = (
+                    agents_portfolio.groupby("statut_agent", dropna=False)
+                    .agg(
+                        agents=("name", "nunique"),
+                        messages=("messages_periode", "sum"),
+                    )
+                    .reset_index()
+                )
+                fig_status = px.bar(
+                    status_summary,
+                    x="statut_agent",
+                    y="messages",
+                    text="agents",
+                    title="Messages agents par statut de publication",
+                )
+                st.plotly_chart(fig_status, use_container_width=True)
+
+            with c2:
+                active_portfolio = agents_portfolio[
+                    agents_portfolio["messages_periode"] > 0
+                ].copy()
+
+                if not active_portfolio.empty:
+                    fig_portfolio = px.scatter(
+                        active_portfolio,
+                        x="utilisateurs_touches",
+                        y="messages_periode",
+                        size="conversations",
+                        color="statut_agent",
+                        hover_name="name",
+                        hover_data=[
+                            "adoption_pct",
+                            "messages_par_utilisateur",
+                            "jours_actifs",
+                            "insight",
+                        ],
+                        title="Portefeuille agents — adoption vs volume d’usage",
+                    )
+                    st.plotly_chart(fig_portfolio, use_container_width=True)
+                else:
+                    st.info("Pas assez de données pour afficher le portefeuille agents.")
+
+            st.divider()
+
+            g1, g2 = st.columns(2)
+
+            with g1:
+                top_agents_insight = (
+                    agents_portfolio.sort_values("messages_periode", ascending=False)
+                    .head(15)
+                    .copy()
+                )
+                if not top_agents_insight.empty:
+                    fig_top_agents = px.bar(
+                        top_agents_insight.sort_values("messages_periode", ascending=True),
+                        x="messages_periode",
+                        y="name",
+                        orientation="h",
+                        color="statut_agent",
+                        title="Top 15 agents par messages",
+                    )
+                    st.plotly_chart(fig_top_agents, use_container_width=True)
+
+            with g2:
+                top_agents_adoption = (
+                    agents_portfolio.sort_values(
+                        ["utilisateurs_touches", "messages_periode"], ascending=False
+                    )
+                    .head(15)
+                    .copy()
+                )
+                if not top_agents_adoption.empty:
+                    fig_top_adoption = px.bar(
+                        top_agents_adoption.sort_values("utilisateurs_touches", ascending=True),
+                        x="utilisateurs_touches",
+                        y="name",
+                        orientation="h",
+                        color="statut_agent",
+                        title="Top 15 agents par utilisateurs touchés",
+                    )
+                    st.plotly_chart(fig_top_adoption, use_container_width=True)
+
+            st.divider()
+
+            st.subheader("Insights actionnables")
+            a1, a2, a3 = st.columns(3)
+
+            with a1:
+                st.markdown("### À rationaliser")
+                published_no_usage_df = agents_portfolio[
+                    (agents_portfolio["statut_agent"] == "Publié")
+                    & (agents_portfolio["messages_periode"] == 0)
+                ].copy()
+                if published_no_usage_df.empty:
+                    st.success("Aucun agent publié sans usage.")
+                else:
+                    cols = [
+                        c
+                        for c in [
+                            "name",
+                            "statut_agent",
+                            "lastEdit_dt",
+                            "distinctUsersReached",
+                            "distinctConversations",
+                            "insight",
+                        ]
+                        if c in published_no_usage_df.columns
+                    ]
+                    st.dataframe(
+                        published_no_usage_df[cols].sort_values("lastEdit_dt", ascending=False),
+                        use_container_width=True,
+                        height=260,
+                    )
+
+            with a2:
+                st.markdown("### À gouverner")
+                unpublished_usage_df = agents_portfolio[
+                    (agents_portfolio["statut_agent"] == "Non publié")
+                    & (agents_portfolio["messages_periode"] > 0)
+                ].copy()
+                if unpublished_usage_df.empty:
+                    st.success("Aucun agent non publié utilisé.")
+                else:
+                    cols = [
+                        c
+                        for c in [
+                            "name",
+                            "messages_periode",
+                            "utilisateurs_touches",
+                            "conversations",
+                            "messages_par_utilisateur",
+                            "insight",
+                        ]
+                        if c in unpublished_usage_df.columns
+                    ]
+                    st.dataframe(
+                        unpublished_usage_df[cols].sort_values("messages_periode", ascending=False),
+                        use_container_width=True,
+                        height=260,
+                    )
+
+            with a3:
+                st.markdown("### À pousser")
+                high_potential_df = agents_portfolio[
+                    (agents_portfolio["messages_periode"] > 0)
+                    & (agents_portfolio["utilisateurs_touches"] >= 3)
+                ].copy()
+                if high_potential_df.empty:
+                    st.info("Pas encore d’agent avec adoption large sur la période.")
+                else:
+                    cols = [
+                        c
+                        for c in [
+                            "name",
+                            "statut_agent",
+                            "messages_periode",
+                            "utilisateurs_touches",
+                            "adoption_pct",
+                            "messages_par_utilisateur",
+                        ]
+                        if c in high_potential_df.columns
+                    ]
+                    st.dataframe(
+                        high_potential_df[cols].sort_values(
+                            ["utilisateurs_touches", "messages_periode"], ascending=False
+                        ),
+                        use_container_width=True,
+                        height=260,
+                    )
+
+            st.divider()
+
+            st.subheader("Nouveaux Agents")
+            st.caption(
+                "Proxy utilisé : `lastEdit` dans la période sélectionnée, faute d’un champ natif de création."
+            )
+
+            if new_agents.empty:
+                st.info("Aucun nouvel agent ou agent récemment édité sur la période.")
+            else:
+                new_agents = new_agents.sort_values(
+                    ["lastEdit_dt", "messages_periode"], ascending=[False, False]
+                )
+
+                n1, n2 = st.columns([1.1, 1])
+
+                with n1:
+                    cols = [
+                        c
+                        for c in [
+                            "name",
+                            "statut_agent",
+                            "lastEdit_dt",
+                            "messages_periode",
+                            "utilisateurs_touches",
+                            "conversations",
+                            "adoption_pct",
+                            "insight",
+                        ]
+                        if c in new_agents.columns
+                    ]
+                    st.dataframe(
+                        new_agents[cols].rename(
+                            columns={
+                                "name": "agent",
+                                "statut_agent": "statut",
+                                "lastEdit_dt": "dernière_édition",
+                                "messages_periode": "messages",
+                                "utilisateurs_touches": "utilisateurs",
+                                "conversations": "conversations",
+                                "adoption_pct": "adoption_%",
+                                "insight": "insight",
+                            }
+                        ),
+                        use_container_width=True,
+                        height=420,
+                    )
+
+                with n2:
+                    fig_new_agents = px.bar(
+                        new_agents.head(20),
+                        x="name",
+                        y="messages_periode",
+                        color="statut_agent",
+                        hover_data=["utilisateurs_touches", "lastEdit_dt", "insight"],
+                        title="Usage des nouveaux / récemment édités",
+                    )
+                    st.plotly_chart(fig_new_agents, use_container_width=True)
+
+            st.divider()
+
+            st.subheader("Table portefeuille agents")
+            portfolio_display_cols = [
+                c
+                for c in [
+                    "name",
+                    "statut_agent",
+                    "messages_periode",
+                    "utilisateurs_touches",
+                    "conversations",
+                    "jours_actifs",
+                    "adoption_pct",
+                    "messages_par_utilisateur",
+                    "lastEdit_dt",
+                    "premier_usage",
+                    "dernier_usage",
+                    "insight",
+                ]
+                if c in agents_portfolio.columns
+            ]
+
+            st.dataframe(
+                agents_portfolio[portfolio_display_cols]
+                .sort_values(["messages_periode", "utilisateurs_touches"], ascending=False)
+                .rename(
+                    columns={
+                        "name": "agent",
+                        "statut_agent": "statut",
+                        "messages_periode": "messages",
+                        "utilisateurs_touches": "utilisateurs",
+                        "conversations": "conversations",
+                        "jours_actifs": "jours_actifs",
+                        "adoption_pct": "adoption_%",
+                        "messages_par_utilisateur": "messages_par_utilisateur",
+                        "lastEdit_dt": "dernière_édition",
+                        "premier_usage": "premier_usage",
+                        "dernier_usage": "dernier_usage",
+                        "insight": "insight",
+                    }
+                ),
+                use_container_width=True,
+                height=520,
+            )
+
+            st.download_button(
+                "Télécharger le portefeuille agents (CSV)",
+                data=agents_portfolio[portfolio_display_cols].to_csv(index=False).encode("utf-8"),
+                file_name="agents_insights_portefeuille.csv",
+                mime="text/csv",
+            )
+
+    # ----------------------------
+    # Modèles
+    # ----------------------------
     with t_llm:
         st.subheader("Comparatif modèles — LLM de base vs via agents")
 
@@ -954,6 +1484,9 @@ def main() -> None:
         else:
             st.info("Aucune tendance journalière disponible pour les familles LLM.")
 
+    # ----------------------------
+    # Utilisateurs & segmentation
+    # ----------------------------
     with t_users:
         st.subheader("Utilisateurs & segmentation")
         st.caption(
@@ -1123,6 +1656,9 @@ def main() -> None:
                 mime="text/csv",
             )
 
+    # ----------------------------
+    # Données & exports
+    # ----------------------------
     with t_data:
         st.subheader("Exports (sans emails)")
 
