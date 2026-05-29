@@ -415,6 +415,24 @@ def enrich_messages(users_df: pd.DataFrame, msgs_df: pd.DataFrame, as_df: pd.Dat
     return df
 
 
+def add_first_seen_in_dust(users_df: pd.DataFrame, msgs_df: pd.DataFrame) -> pd.DataFrame:
+    df_users = users_df.copy()
+
+    if msgs_df.empty or "user_id" not in msgs_df.columns or "created_at" not in msgs_df.columns:
+        df_users["first_seen_in_dust"] = pd.NaT
+        return df_users
+
+    first_seen = (
+        msgs_df.dropna(subset=["created_at"])
+        .groupby("user_id", dropna=False)["created_at"]
+        .min()
+        .reset_index()
+        .rename(columns={"created_at": "first_seen_in_dust"})
+    )
+
+    return df_users.merge(first_seen, on="user_id", how="left")
+
+
 # ============================
 # Segmentation utilisateurs
 # ============================
@@ -682,9 +700,10 @@ def main() -> None:
     as_df = normalize_assistants(as_raw)
     msgs_df = normalize_messages(msgs_raw)
     msgs_enriched = enrich_messages(users_df, msgs_df, as_df)
+    users_enriched = add_first_seen_in_dust(users_df, msgs_df)
     period_start_dt, period_end_dt = get_period_bounds(mode, start_param, end_param)
 
-    membres_total = int(users_df["user_id"].nunique()) if "user_id" in users_df.columns else int(len(users_df))
+    membres_total = int(users_enriched["user_id"].nunique()) if "user_id" in users_enriched.columns else int(len(users_enriched))
 
     cout_periode = cout_ttc_periode_par_membres(
         mode=mode,
@@ -695,10 +714,10 @@ def main() -> None:
         tva_pct=float(tva_pct),
     )
 
-    users_seg = compute_weekly_coverage_all_users(users_df, msgs_enriched)
+    users_seg = compute_weekly_coverage_all_users(users_enriched, msgs_enriched)
 
     kpis = compute_kpis(
-        users_df=users_df,
+        users_df=users_enriched,
         msgs_df=msgs_enriched,
         membres_total=membres_total,
         seuil_actif_messages=int(seuil_actif),
@@ -959,7 +978,6 @@ def main() -> None:
                 100.0 * agents_portfolio["utilisateurs_touches"] / max(1, int(kpis["users_total"]))
             ).round(1)
 
-            # Top 15 agents
             g1, g2 = st.columns(2)
 
             with g1:
@@ -1004,7 +1022,6 @@ def main() -> None:
 
             st.divider()
 
-            # Nouveaux agents
             st.subheader("Nouveaux Agents")
             st.caption(
                 "Proxy utilisé : `lastEdit` dans la période sélectionnée, faute d’un champ natif de création."
@@ -1068,7 +1085,6 @@ def main() -> None:
 
             st.divider()
 
-            # Table portefeuille agents
             st.subheader("Table portefeuille agents")
 
             portfolio_display_cols = [
@@ -1200,7 +1216,8 @@ def main() -> None:
     with t_users:
         st.subheader("Utilisateurs & segmentation")
         st.caption(
-            "Vue simple pour comprendre l’adoption : volume d’usage et régularité sur la période."
+            "Vue simple pour comprendre l’adoption : volume d’usage et régularité sur la période. "
+            "`first_seen_in_dust` = premier message observé dans les logs chargés pour la période sélectionnée."
         )
 
         nb_inactifs = int((users_seg["segment_usage"] == "Inactifs (0)").sum())
@@ -1312,6 +1329,7 @@ def main() -> None:
                 "semaines_periode",
                 "taux_couverture_semaines_pct",
                 "regularite_periode",
+                "first_seen_in_dust",
                 "dernier_message",
                 "groups",
             ]
@@ -1329,6 +1347,7 @@ def main() -> None:
                 "semaines_periode": "semaines_période",
                 "taux_couverture_semaines_pct": "% couverture semaines",
                 "regularite_periode": "régularité période",
+                "first_seen_in_dust": "first_seen_in_dust",
                 "dernier_message": "dernier_message",
                 "groups": "groupe",
             }
@@ -1404,19 +1423,35 @@ def main() -> None:
 
         st.divider()
         st.markdown("### users (sans affichage email)")
+        st.caption(
+            "`first_seen_in_dust` = premier message observé dans les logs chargés pour la période sélectionnée."
+        )
+
         keep_u = [
-            c for c in ["user_id", "user_name", "messageCount", "activeDaysCount", "lastMessageSent", "groups"]
-            if c in users_df.columns
+            c
+            for c in [
+                "user_id",
+                "user_name",
+                "first_seen_in_dust",
+                "messageCount",
+                "activeDaysCount",
+                "lastMessageSent",
+                "groups",
+            ]
+            if c in users_seg.columns
         ]
+
+        users_export_df = users_seg[keep_u].copy()
+
         st.dataframe(
-            users_df[keep_u].sort_values("messageCount", ascending=False) if "messageCount" in users_df.columns else users_df[keep_u],
+            users_export_df.sort_values("messageCount", ascending=False) if "messageCount" in users_export_df.columns else users_export_df,
             use_container_width=True,
             height=420,
         )
 
         st.download_button(
             "Télécharger users_clean.csv",
-            data=users_df[keep_u].to_csv(index=False).encode("utf-8"),
+            data=users_export_df.to_csv(index=False).encode("utf-8"),
             file_name="users_clean.csv",
             mime="text/csv",
         )
